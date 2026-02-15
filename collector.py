@@ -14,6 +14,7 @@ import json
 import time
 import sys
 import os
+import gzip
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 import winreg
@@ -31,6 +32,7 @@ COLLECTOR_VERSION = "1.1.0"
 BATCH_SIZE = 1000
 COLLECTION_INTERVAL_SECONDS = 30
 CHECKPOINT_FILE = "checkpoint.json"
+MAX_FILE_SIZE_MB = 50  # Rotate file when it reaches this size
 
 # Network-related keywords for exclusion
 NETWORK_CHANNEL_KEYWORDS = [
@@ -266,6 +268,48 @@ def collect_events_from_channel(channel: str, last_record_id: int) -> List[Dict]
     return events
 
 
+def rotate_and_compress_file(filepath: str) -> str:
+    """
+    Compress current log file and create a new one
+    Returns the path to the new file
+    """
+    try:
+        # Compress current file
+        compressed_path = filepath + '.gz'
+        print(f"\nRotating log file: {filepath} -> {compressed_path}")
+        
+        with open(filepath, 'rb') as f_in:
+            with gzip.open(compressed_path, 'wb', compresslevel=6) as f_out:
+                # Compress in chunks to handle large files
+                chunk_size = 1024 * 1024  # 1MB chunks
+                while True:
+                    chunk = f_in.read(chunk_size)
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+        
+        # Get sizes for reporting
+        original_size = os.path.getsize(filepath)
+        compressed_size = os.path.getsize(compressed_path)
+        ratio = compressed_size / original_size
+        
+        print(f"Compressed: {original_size/1024/1024:.2f}MB -> {compressed_size/1024/1024:.2f}MB ({ratio:.1%})")
+        
+        # Remove original file
+        os.remove(filepath)
+        
+        # Create new output file with current timestamp
+        new_filepath = f"events_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        print(f"New log file: {new_filepath}\n")
+        
+        return new_filepath
+    
+    except Exception as e:
+        print(f"Error rotating file: {e}", file=sys.stderr)
+        # Return original filepath to continue operation
+        return filepath
+
+
 def validate_and_repair_json_file(filepath: str) -> bool:
     """
     Validate JSON file and repair common issues
@@ -345,6 +389,12 @@ def run_collector():
             
             print(f"\n[Cycle {cycle_count}] {datetime.now(timezone.utc).isoformat()}")
             
+            # Check if file size exceeds limit
+            if os.path.exists(output_file):
+                file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
+                if file_size_mb >= MAX_FILE_SIZE_MB:
+                    output_file = rotate_and_compress_file(output_file)
+            
             # Validate output file before writing
             validate_and_repair_json_file(output_file)
             
@@ -376,7 +426,8 @@ def run_collector():
                                 # Single write operation to prevent partial lines
                                 json_line = json.dumps(output_entry, separators=(',', ':'), ensure_ascii=False)
                                 f.write(json_line + '\n')
-                                f.flush()  # Ensure data is written immediately
+                                f.flush()  # Flush Python buffer
+                                os.fsync(f.fileno())  # Force OS-level write to disk
                     
                     except Exception as e:
                         print(f"Error writing events to file: {e}", file=sys.stderr)

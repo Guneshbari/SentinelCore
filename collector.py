@@ -1,49 +1,103 @@
 """
-SentinelCore - Production-grade Windows Telemetry Collector
-Version: 1.1.0 (Production)
-Uses modern Windows Eventing API (EvtQuery) for efficient event collection
+SentinelCore - Production-grade Windows Telemetry Agent
+Version: 2.0.0
+Focus: System Stability and Critical Fault Detection
 
-DEPLOYMENT NOTES:
-- Single self-contained file - no external dependencies except pywin32
-- Self-healing JSON output with automatic validation
-- Robust error handling for production environments
-- Designed for deployment to 100+ endpoints
+Uses modern Windows Eventing API (EvtQuery) for efficient event collection.
+Sends structured, integrity-safe data to Linux server via HTTPS.
+
+PRODUCTION FEATURES:
+- Targeted log collection (System, Kernel-Power, DriverFrameworks)
+- Multi-level event filtering (level, provider name)
+- SHA256 integrity hashing for duplicate detection
+- System resource monitoring (CPU, memory, disk)
+- HTTPS transmission with exponential backoff retry
+- Checkpoint advancement only on successful transmission
+- Graceful handling of non-admin execution
 """
 
 import json
 import time
 import sys
 import os
-import gzip
+import socket
+import hashlib
+import re
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
+from collections import deque
 import winreg
+import uuid
 
 try:
     import win32evtlog
-    import win32evtlogutil
     import pywintypes
 except ImportError:
     print("ERROR: pywin32 is required. Install with: pip install pywin32", file=sys.stderr)
     sys.exit(1)
 
-# Constants
-COLLECTOR_VERSION = "1.1.0"
+try:
+    import psutil
+except ImportError:
+    print("ERROR: psutil is required. Install with: pip install psutil", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    import requests
+except ImportError:
+    print("ERROR: requests is required. Install with: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+COLLECTOR_VERSION = "2.0.0"
+
+# Testing Mode - Set to True for local testing without server
+LOCAL_TESTING_MODE = os.getenv("SENTINEL_LOCAL_MODE", "true").lower() == "true"
+
+# Server Configuration (only used when LOCAL_TESTING_MODE = False)
+SERVER_ENDPOINT = os.getenv("SENTINEL_SERVER_URL", "https://your-server.com/api/events")
+AUTH_TOKEN = os.getenv("SENTINEL_AUTH_TOKEN", None)  # Optional Bearer token
+REQUEST_TIMEOUT = 30  # seconds
+
+# Collection Configuration
+TARGET_LOGS = [
+    "System",
+    "Microsoft-Windows-Kernel-Power",
+    "Microsoft-Windows-DriverFrameworks-UserMode/Operational"
+]
+
+# Event Filtering
+INCLUDE_LEVELS = [1, 2, 3]  # Critical=1, Error=2, Warning=3
+EXCLUDE_PROVIDER_KEYWORDS = [
+    "tcpip", "dns", "dhcp", "wlan", "smb", "network",
+    "firewall", "winhttp", "wininet"
+]
+
+# Collection Behavior
 BATCH_SIZE = 1000
 COLLECTION_INTERVAL_SECONDS = 30
 CHECKPOINT_FILE = "checkpoint.json"
-MAX_FILE_SIZE_MB = 50  # Rotate file when it reaches this size
 
-# Network-related keywords for exclusion
-NETWORK_CHANNEL_KEYWORDS = [
-    "tcp", "dns", "dhcp", "wlan", "smb", "network",
-    "winhttp", "wininet", "firewall", "ndis"
-]
+# Retry Configuration
+MAX_RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_BASE = 1.0  # seconds
+DUPLICATE_HASH_WINDOW = 10000  # Keep last N event hashes
 
-NETWORK_PROVIDER_KEYWORDS = [
-    "tcpip", "dns", "dhcp", "wlan", "smb", "network"
-]
+# Local File Output Configuration
+LOCAL_OUTPUT_FILE = "collected_events.json"  # Output file for local testing
+MAX_EVENTS_PER_FILE = 500  # Limit events per file to keep size manageable
+PRETTY_PRINT_JSON = True  # Make JSON human-readable for analysis
 
+# Fallback Configuration (only for non-testing mode)
+ENABLE_LOCAL_FALLBACK = True  # Write to local file if HTTPS fails
+FALLBACK_FILE_PREFIX = "events_fallback"
+
+# ============================================================================
+# SYSTEM METADATA FUNCTIONS
+# ============================================================================
 
 def get_system_id() -> str:
     """Get unique system identifier from Windows Machine GUID"""
@@ -62,29 +116,25 @@ def get_system_id() -> str:
         return "UNKNOWN"
 
 
-def get_boot_session_id() -> str:
-    """Get current boot session identifier"""
+def get_hostname() -> str:
+    """Get system hostname"""
     try:
-        # Query for the most recent Event ID 6005 (Event Log service started)
-        query = win32evtlog.EvtQuery(
-            "System",
-            win32evtlog.EvtQueryReverseDirection,
-            "*[System[(EventID=6005)]]",
-            None
-        )
-        
-        events = win32evtlog.EvtNext(query, 1, 0)
-        if events:
-            xml = win32evtlog.EvtRender(events[0], win32evtlog.EvtRenderEventXml)
-            # Extract timestamp from XML
-            import re
-            match = re.search(r"SystemTime='([^']+)'", xml)
-            if match:
-                return match.group(1).replace(":", "").replace("-", "").replace(".", "")[:14]
+        return socket.gethostname()
+    except Exception as e:
+        print(f"Warning: Could not get hostname: {e}", file=sys.stderr)
+        return "UNKNOWN"
+
+
+def get_boot_session_id() -> str:
+    """Get current boot session identifier as UUID"""
+    try:
+        boot_time = psutil.boot_time()
+        # Generate deterministic UUID from boot time and system ID
+        seed = f"{get_system_id()}-{boot_time}"
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
     except Exception as e:
         print(f"Warning: Could not determine boot session: {e}", file=sys.stderr)
-    
-    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        return str(uuid.uuid4())
 
 
 def get_os_version() -> str:
@@ -96,10 +146,8 @@ def get_os_version() -> str:
             0,
             winreg.KEY_READ
         )
-        
         product_name, _ = winreg.QueryValueEx(key, "ProductName")
         current_build, _ = winreg.QueryValueEx(key, "CurrentBuild")
-        
         winreg.CloseKey(key)
         return f"{product_name} (Build {current_build})"
     except Exception as e:
@@ -107,42 +155,110 @@ def get_os_version() -> str:
         return "Windows (Unknown Version)"
 
 
-def enumerate_event_channels() -> List[str]:
-    """Enumerate all available Windows event channels"""
-    channels = []
-    
+def get_uptime_seconds() -> int:
+    """Get system uptime in seconds"""
     try:
-        enum_handle = win32evtlog.EvtOpenChannelEnum()
-        
-        while True:
-            try:
-                channel = win32evtlog.EvtNextChannelPath(enum_handle)
-                if channel is None:
-                    break
-                channels.append(channel)
-            except pywintypes.error:
-                break
-        
+        return int(time.time() - psutil.boot_time())
     except Exception as e:
-        print(f"Error enumerating channels: {e}", file=sys.stderr)
-    
-    return channels
+        print(f"Warning: Could not calculate uptime: {e}", file=sys.stderr)
+        return 0
+
+# ============================================================================
+# RESOURCE MONITORING
+# ============================================================================
+
+def get_resource_snapshot() -> Dict[str, float]:
+    """Get current system resource usage"""
+    try:
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        return {
+            "cpu_usage_percent": round(cpu_percent, 2),
+            "memory_usage_percent": round(memory.percent, 2),
+            "disk_free_percent": round(100.0 - disk.percent, 2)
+        }
+    except Exception as e:
+        print(f"Warning: Could not get resource snapshot: {e}", file=sys.stderr)
+        return {
+            "cpu_usage_percent": 0.0,
+            "memory_usage_percent": 0.0,
+            "disk_free_percent": 0.0
+        }
+
+# ============================================================================
+# EVENT PARSING AND FILTERING
+# ============================================================================
+
+def extract_event_metadata(xml: str) -> Optional[Dict]:
+    """Extract metadata from event XML"""
+    try:
+        metadata = {}
+        
+        # EventRecordID
+        match = re.search(r'EventRecordID["\']?>(\d+)<', xml)
+        metadata['event_record_id'] = int(match.group(1)) if match else None
+        
+        # Provider Name
+        match = re.search(r'Provider.*?Name=["\']([^"\']+)["\']', xml)
+        metadata['provider_name'] = match.group(1) if match else "Unknown"
+        
+        # Event ID
+        match = re.search(r'EventID["\']?>(\d+)<', xml)
+        metadata['event_id'] = int(match.group(1)) if match else 0
+        
+        # Level
+        match = re.search(r'Level["\']?>(\d+)<', xml)
+        metadata['level'] = int(match.group(1)) if match else 0
+        
+        # Task
+        match = re.search(r'Task["\']?>(\d+)<', xml)
+        metadata['task'] = int(match.group(1)) if match else 0
+        
+        # Opcode
+        match = re.search(r'Opcode["\']?>(\d+)<', xml)
+        metadata['opcode'] = int(match.group(1)) if match else 0
+        
+        # Keywords
+        match = re.search(r'Keywords["\']?>(0x[0-9a-fA-F]+)<', xml)
+        metadata['keywords'] = match.group(1) if match else "0x0"
+        
+        # Process ID
+        match = re.search(r'ProcessID["\']?>(\d+)<', xml)
+        metadata['process_id'] = int(match.group(1)) if match else 0
+        
+        # Thread ID
+        match = re.search(r'ThreadID["\']?>(\d+)<', xml)
+        metadata['thread_id'] = int(match.group(1)) if match else 0
+        
+        # TimeCreated SystemTime
+        match = re.search(r'SystemTime=["\']([^"\']+)["\']', xml)
+        metadata['event_time'] = match.group(1) if match else datetime.now(timezone.utc).isoformat()
+        
+        return metadata
+    except Exception as e:
+        print(f"Warning: Could not parse event metadata: {e}", file=sys.stderr)
+        return None
 
 
-def is_network_related(channel_name: str) -> bool:
-    """Check if a channel is network-related based on keyword matching"""
-    channel_lower = channel_name.lower()
-    
-    for keyword in NETWORK_CHANNEL_KEYWORDS:
-        if keyword in channel_lower:
+def should_exclude_provider(provider_name: str) -> bool:
+    """Check if provider should be excluded based on keywords"""
+    provider_lower = provider_name.lower()
+    for keyword in EXCLUDE_PROVIDER_KEYWORDS:
+        if keyword in provider_lower:
             return True
-    
-    for keyword in NETWORK_PROVIDER_KEYWORDS:
-        if keyword in channel_lower:
-            return True
-    
     return False
 
+
+def generate_event_hash(raw_xml: str, system_id: str, event_record_id: int) -> str:
+    """Generate SHA256 hash for event integrity and deduplication"""
+    content = f"{raw_xml}{system_id}{event_record_id}"
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+# ============================================================================
+# CHECKPOINT MANAGER
+# ============================================================================
 
 class CheckpointManager:
     """Manages per-channel checkpointing using EventRecordID"""
@@ -174,37 +290,192 @@ class CheckpointManager:
         self.checkpoints[channel] = record_id
     
     def save(self):
-        """Save checkpoints to file"""
+        """Atomically save checkpoints to file"""
         try:
-            with open(self.checkpoint_file, 'w', encoding='utf-8') as f:
+            # Write to temporary file first
+            temp_file = f"{self.checkpoint_file}.tmp"
+            with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.checkpoints, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            # Atomic rename
+            os.replace(temp_file, self.checkpoint_file)
         except Exception as e:
             print(f"Error saving checkpoint: {e}", file=sys.stderr)
 
+# ============================================================================
+# LOCAL FILE MANAGER (for testing mode)
+# ============================================================================
 
-def extract_record_id_from_xml(xml: str) -> Optional[int]:
-    """Extract EventRecordID from rendered XML"""
-    import re
-    match = re.search(r"EventRecordID['\"]?>(\d+)<", xml)
-    if match:
-        return int(match.group(1))
-    return None
+class LocalFileManager:
+    """Handles local file output for testing without server"""
+    
+    def __init__(self, output_file: str):
+        self.output_file = output_file
+        self.event_count = 0
+        self.file_number = 1
+        self._load_or_create_file()
+    
+    def _load_or_create_file(self):
+        """Load existing file or create new one"""
+        if os.path.exists(self.output_file):
+            try:
+                with open(self.output_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.event_count = len(data.get('events', []))
+                print(f"Loaded existing output file: {self.event_count} events")
+            except Exception as e:
+                print(f"Warning: Could not load existing file: {e}")
+                self.event_count = 0
+        else:
+            # Create new file with structure
+            self._create_new_file()
+    
+    def _create_new_file(self):
+        """Create new JSON file with initial structure"""
+        initial_data = {
+            "collector_info": {
+                "version": COLLECTOR_VERSION,
+                "mode": "local_testing",
+                "created": datetime.now(timezone.utc).isoformat()
+            },
+            "events": []
+        }
+        with open(self.output_file, 'w', encoding='utf-8') as f:
+            json.dump(initial_data, f, indent=2 if PRETTY_PRINT_JSON else None)
+        self.event_count = 0
+        print(f"Created new output file: {self.output_file}")
+    
+    def _rotate_file_if_needed(self):
+        """Rotate file if event limit reached"""
+        if self.event_count >= MAX_EVENTS_PER_FILE:
+            # Rename current file
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+            archived_name = f"collected_events_{timestamp}.json"
+            os.rename(self.output_file, archived_name)
+            print(f"  → Rotated to {archived_name} ({self.event_count} events)")
+            
+            # Create new file
+            self._create_new_file()
+            self.file_number += 1
+    
+    def save_batch(self, payload: Dict) -> bool:
+        """Save event batch to local file. Returns True if successful."""
+        try:
+            # Check if rotation needed
+            self._rotate_file_if_needed()
+            
+            # Read current file
+            with open(self.output_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Update metadata
+            data['last_updated'] = payload.get('timestamp_collected')
+            data['system_info'] = {
+                'system_id': payload.get('system_id'),
+                'hostname': payload.get('hostname'),
+                'boot_session_id': payload.get('boot_session_id'),
+                'os_version': payload.get('os_version'),
+                'uptime_seconds': payload.get('uptime_seconds')
+            }
+            
+            # Add new events
+            new_events = payload.get('events', [])
+            data['events'].extend(new_events)
+            self.event_count += len(new_events)
+            
+            # Write back to file
+            with open(self.output_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2 if PRETTY_PRINT_JSON else None, ensure_ascii=False)
+            
+            return True
+            
+        except Exception as e:
+            print(f"  ✗ Error saving to local file: {e}", file=sys.stderr)
+            return False
 
+# ============================================================================
+# TRANSMISSION MANAGER
+# ============================================================================
+
+class TransmissionManager:
+    """Handles HTTPS transmission with retry logic and fallback"""
+    
+    def __init__(self, endpoint: str, auth_token: Optional[str] = None):
+        self.endpoint = endpoint
+        self.auth_token = auth_token
+        self.session = requests.Session()
+        
+        # Set headers
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'User-Agent': f'SentinelCore/{COLLECTOR_VERSION}'
+        })
+        
+        if self.auth_token:
+            self.session.headers['Authorization'] = f'Bearer {self.auth_token}'
+    
+    def send_batch(self, payload: Dict) -> bool:
+        """Send event batch with retry logic. Returns True if successful."""
+        for attempt in range(MAX_RETRY_ATTEMPTS):
+            try:
+                response = self.session.post(
+                    self.endpoint,
+                    json=payload,
+                    timeout=REQUEST_TIMEOUT
+                )
+                
+                if response.status_code in [200, 201, 202]:
+                    if attempt > 0:
+                        print(f"  ✓ Transmission successful on retry {attempt + 1}")
+                    return True
+                else:
+                    print(f"  ✗ Server returned {response.status_code}: {response.text[:100]}", file=sys.stderr)
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"  ✗ Transmission failed (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS}): {e}", file=sys.stderr)
+            
+            # Exponential backoff before retry
+            if attempt < MAX_RETRY_ATTEMPTS - 1:
+                sleep_time = RETRY_BACKOFF_BASE * (2 ** attempt)
+                time.sleep(sleep_time)
+        
+        return False
+    
+    def save_to_fallback(self, payload: Dict):
+        """Save failed transmission to local fallback file"""
+        if not ENABLE_LOCAL_FALLBACK:
+            return
+        
+        try:
+            fallback_file = f"{FALLBACK_FILE_PREFIX}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+            with open(fallback_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            print(f"  ⚠ Saved to fallback file: {fallback_file}")
+        except Exception as e:
+            print(f"  ✗ Could not save to fallback: {e}", file=sys.stderr)
+
+# ============================================================================
+# EVENT COLLECTION
+# ============================================================================
 
 def collect_events_from_channel(channel: str, last_record_id: int) -> List[Dict]:
     """
-    Collect events from a channel incrementally using EventRecordID
-    Returns list of events with: {log_channel, record_id, xml}
+    Collect events from a channel with multi-level filtering
+    Returns list of events with metadata and raw XML
     """
     events = []
-    query_handle = None
     
     try:
-        # Build XML query for incremental collection
+        # Build XPath query for incremental collection with level filtering
+        level_filter = " or ".join([f"Level={level}" for level in INCLUDE_LEVELS])
         query = f"""
         <QueryList>
             <Query>
-                <Select Path="{channel}">*[System[EventRecordID &gt; {last_record_id}]]</Select>
+                <Select Path="{channel}">
+                    *[System[({level_filter}) and EventRecordID &gt; {last_record_id}]]
+                </Select>
             </Query>
         </QueryList>
         """
@@ -229,19 +500,27 @@ def collect_events_from_channel(channel: str, last_record_id: int) -> List[Dict]
                         # Render event as XML
                         xml = win32evtlog.EvtRender(event, win32evtlog.EvtRenderEventXml)
                         
-                        # Extract EventRecordID
-                        record_id = extract_record_id_from_xml(xml)
-                        if record_id is None:
+                        if not xml:
+                            continue  # Skip if render failed
+                        
+                        # Extract metadata
+                        metadata = extract_event_metadata(xml)
+                        if not metadata or not metadata['event_record_id']:
                             continue
                         
+                        # Filter by provider name
+                        if should_exclude_provider(metadata['provider_name']):
+                            continue
+                        
+                        # Add to results
                         events.append({
-                            "log_channel": channel,
-                            "record_id": record_id,
-                            "xml": xml
+                            'metadata': metadata,
+                            'raw_xml': xml,
+                            'log_channel': channel
                         })
                         
                     except Exception as e:
-                        # Silently skip individual event errors in production
+                        # Skip individual event errors
                         continue
                 
             except pywintypes.error as e:
@@ -253,131 +532,71 @@ def collect_events_from_channel(channel: str, last_record_id: int) -> List[Dict]
     except pywintypes.error as e:
         error_code = e.winerror
         
-        # Only log critical errors in production
-        if error_code not in [15007, 5, 15001, 1734]:  # Expected errors
+        # Handle expected errors gracefully
+        if error_code in [15007, 5, 15001, 1734]:  # Access denied, not found, etc.
+            pass  # Silently skip in production
+        else:
             print(f"Error querying channel {channel}: {e}", file=sys.stderr)
     
     except Exception as e:
-        # Silently handle unexpected errors in production
-        pass
-    
-    finally:
-        # Python handles cleanup automatically
-        pass
+        # Log unexpected errors but don't crash
+        print(f"Unexpected error in channel {channel}: {e}", file=sys.stderr)
     
     return events
 
-
-def rotate_and_compress_file(filepath: str) -> str:
-    """
-    Compress current log file and create a new one
-    Returns the path to the new file
-    """
-    try:
-        # Compress current file
-        compressed_path = filepath + '.gz'
-        print(f"\nRotating log file: {filepath} -> {compressed_path}")
-        
-        with open(filepath, 'rb') as f_in:
-            with gzip.open(compressed_path, 'wb', compresslevel=6) as f_out:
-                # Compress in chunks to handle large files
-                chunk_size = 1024 * 1024  # 1MB chunks
-                while True:
-                    chunk = f_in.read(chunk_size)
-                    if not chunk:
-                        break
-                    f_out.write(chunk)
-        
-        # Get sizes for reporting
-        original_size = os.path.getsize(filepath)
-        compressed_size = os.path.getsize(compressed_path)
-        ratio = compressed_size / original_size
-        
-        print(f"Compressed: {original_size/1024/1024:.2f}MB -> {compressed_size/1024/1024:.2f}MB ({ratio:.1%})")
-        
-        # Remove original file
-        os.remove(filepath)
-        
-        # Create new output file with current timestamp
-        new_filepath = f"events_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
-        print(f"New log file: {new_filepath}\n")
-        
-        return new_filepath
-    
-    except Exception as e:
-        print(f"Error rotating file: {e}", file=sys.stderr)
-        # Return original filepath to continue operation
-        return filepath
-
-
-def validate_and_repair_json_file(filepath: str) -> bool:
-    """
-    Validate JSON file and repair common issues
-    Returns True if file is valid/was repaired, False otherwise
-    """
-    if not os.path.exists(filepath):
-        return True  # File doesn't exist yet, will be created fresh
-    
-    try:
-        # Read file
-        with open(filepath, 'rb') as f:
-            data = f.read()
-        
-        # Remove trailing whitespace
-        original_size = len(data)
-        data = data.rstrip()
-        
-        if len(data) < original_size:
-            # File had trailing whitespace, repair it
-            with open(filepath, 'wb') as f:
-                f.write(data)
-            print(f"Repaired {filepath}: removed trailing blank lines")
-        
-        return True
-    
-    except Exception as e:
-        print(f"Warning: Could not validate/repair {filepath}: {e}", file=sys.stderr)
-        return False
-
+# ============================================================================
+# MAIN COLLECTOR
+# ============================================================================
 
 def run_collector():
     """Main collection loop"""
-    print(f"SentinelCore v{COLLECTOR_VERSION} - Windows Telemetry Collector (Production)")
-    print("=" * 60)
+    print(f"SentinelCore v{COLLECTOR_VERSION} - Production Telemetry Agent")
+    print("=" * 70)
     
     # Initialize system metadata
     system_id = get_system_id()
+    hostname = get_hostname()
     boot_session_id = get_boot_session_id()
     os_version = get_os_version()
     
-    print(f"System ID: {system_id}")
-    print(f"Boot Session: {boot_session_id}")
-    print(f"OS Version: {os_version}")
-    print("=" * 60)
+    print(f"System ID:      {system_id}")
+    print(f"Hostname:       {hostname}")
+    print(f"Boot Session:   {boot_session_id}")
+    print(f"OS Version:     {os_version}")
+    print(f"Uptime:         {get_uptime_seconds()}s")
+    print("=" * 70)
     
-    # Initialize checkpoint manager
+    # Initialize managers
     checkpoint_mgr = CheckpointManager(CHECKPOINT_FILE)
     
-    # Enumerate and filter channels
-    print("\nEnumerating event channels...")
-    all_channels = enumerate_event_channels()
-    print(f"Found {len(all_channels)} total channels")
+    if LOCAL_TESTING_MODE:
+        # Use local file output for testing
+        file_mgr = LocalFileManager(LOCAL_OUTPUT_FILE)
+        transmission_mgr = None
+    else:
+        # Use HTTPS transmission for production
+        transmission_mgr = TransmissionManager(SERVER_ENDPOINT, AUTH_TOKEN)
+        file_mgr = None
     
-    # Filter out network-related channels
-    channels = [ch for ch in all_channels if not is_network_related(ch)]
-    excluded_count = len(all_channels) - len(channels)
+    # Duplicate detection
+    seen_hashes: deque = deque(maxlen=DUPLICATE_HASH_WINDOW)
     
-    print(f"Excluded {excluded_count} network-related channels")
-    print(f"Monitoring {len(channels)} channels")
-    print("=" * 60)
+    # Display configuration
+    print(f"\nMode:           {'LOCAL TESTING' if LOCAL_TESTING_MODE else 'PRODUCTION'}")
+    print(f"Target Logs:    {', '.join(TARGET_LOGS)}")
     
-    # Create output file
-    output_file = f"events_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
-    print(f"Output file: {output_file}")
-    print(f"Checkpoint file: {CHECKPOINT_FILE}")
-    print(f"Collection interval: {COLLECTION_INTERVAL_SECONDS}s")
-    print("=" * 60)
-    print("\nStarting collection loop... (Press Ctrl+C to stop)")
+    if LOCAL_TESTING_MODE:
+        print(f"Output File:    {LOCAL_OUTPUT_FILE}")
+        print(f"Max Events:     {MAX_EVENTS_PER_FILE} per file")
+        print(f"Format:         {'Pretty JSON' if PRETTY_PRINT_JSON else 'Compact JSON'}")
+    else:
+        print(f"Server:         {SERVER_ENDPOINT}")
+        print(f"Auth:           {'Enabled' if AUTH_TOKEN else 'Disabled'}")
+        print(f"Fallback:       {'Enabled' if ENABLE_LOCAL_FALLBACK else 'Disabled'}")
+    
+    print(f"Interval:       {COLLECTION_INTERVAL_SECONDS}s")
+    print("=" * 70)
+    print("\nStarting collection loop... (Press Ctrl+C to stop)\n")
     
     cycle_count = 0
     
@@ -385,65 +604,99 @@ def run_collector():
         while True:
             cycle_count += 1
             cycle_start = time.time()
-            total_events = 0
+            batch_events = []
             
-            print(f"\n[Cycle {cycle_count}] {datetime.now(timezone.utc).isoformat()}")
+            print(f"[Cycle {cycle_count}] {datetime.now(timezone.utc).isoformat()}")
             
-            # Check if file size exceeds limit
-            if os.path.exists(output_file):
-                file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-                if file_size_mb >= MAX_FILE_SIZE_MB:
-                    output_file = rotate_and_compress_file(output_file)
-            
-            # Validate output file before writing
-            validate_and_repair_json_file(output_file)
-            
-            # Collect from all channels
-            for channel in channels:
+            # Collect from target channels
+            for channel in TARGET_LOGS:
                 last_record_id = checkpoint_mgr.get_last_record_id(channel)
-                
-                # Collect new events
                 events = collect_events_from_channel(channel, last_record_id)
                 
                 if events:
                     print(f"  {channel}: {len(events)} new events")
                     
-                    # Write events to output file (production-safe)
-                    try:
-                        with open(output_file, 'a', encoding='utf-8') as f:
-                            for event in events:
-                                output_entry = {
-                                    "system_id": system_id,
-                                    "boot_session_id": boot_session_id,
-                                    "os_version": os_version,
-                                    "collector_version": COLLECTOR_VERSION,
-                                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    "log_channel": event["log_channel"],
-                                    "record_id": event["record_id"],
-                                    "xml": event["xml"]
-                                }
-                                
-                                # Single write operation to prevent partial lines
-                                json_line = json.dumps(output_entry, separators=(',', ':'), ensure_ascii=False)
-                                f.write(json_line + '\n')
-                                f.flush()  # Flush Python buffer
-                                os.fsync(f.fileno())  # Force OS-level write to disk
-                    
-                    except Exception as e:
-                        print(f"Error writing events to file: {e}", file=sys.stderr)
-                        continue
+                    for event in events:
+                        # Generate event hash
+                        event_hash = generate_event_hash(
+                            event['raw_xml'],
+                            system_id,
+                            event['metadata']['event_record_id']
+                        )
+                        
+                        # Skip duplicates
+                        if event_hash in seen_hashes:
+                            continue
+                        
+                        seen_hashes.append(event_hash)
+                        
+                        # Get resource snapshot
+                        resources = get_resource_snapshot()
+                        
+                        # Build event payload
+                        event_payload = {
+                            'log_channel': event['log_channel'],
+                            'event_record_id': event['metadata']['event_record_id'],
+                            'provider_name': event['metadata']['provider_name'],
+                            'event_id': event['metadata']['event_id'],
+                            'level': event['metadata']['level'],
+                            'task': event['metadata']['task'],
+                            'opcode': event['metadata']['opcode'],
+                            'keywords': event['metadata']['keywords'],
+                            'process_id': event['metadata']['process_id'],
+                            'thread_id': event['metadata']['thread_id'],
+                            'event_time': event['metadata']['event_time'],
+                            'cpu_usage_percent': resources['cpu_usage_percent'],
+                            'memory_usage_percent': resources['memory_usage_percent'],
+                            'disk_free_percent': resources['disk_free_percent'],
+                            'event_hash': event_hash,
+                            'raw_xml': event['raw_xml']
+                        }
+                        
+                        batch_events.append(event_payload)
                     
                     # Update checkpoint with highest record ID
-                    max_record_id = max(e["record_id"] for e in events)
-                    checkpoint_mgr.update_checkpoint(channel, max_record_id)
+                    max_record_id = max(e['metadata']['event_record_id'] for e in events)
                     
-                    total_events += len(events)
-            
-            # Save checkpoints
-            checkpoint_mgr.save()
+                    # Transmit batch if we have events
+                    if batch_events:
+                        # Build transmission payload
+                        payload = {
+                            'system_id': system_id,
+                            'hostname': hostname,
+                            'boot_session_id': boot_session_id,
+                            'os_version': os_version,
+                            'uptime_seconds': get_uptime_seconds(),
+                            'collector_version': COLLECTOR_VERSION,
+                            'timestamp_collected': datetime.now(timezone.utc).isoformat(),
+                            'events': batch_events
+                        }
+                        
+                        # Save batch (local file or HTTPS depending on mode)
+                        if LOCAL_TESTING_MODE:
+                            # Local testing mode - write to file
+                            if file_mgr.save_batch(payload):
+                                print(f"  ✓ Saved {len(batch_events)} events to {LOCAL_OUTPUT_FILE}")
+                                # Always advance checkpoint in testing mode
+                                checkpoint_mgr.update_checkpoint(channel, max_record_id)
+                                checkpoint_mgr.save()
+                            else:
+                                print(f"  ✗ Failed to save events locally")
+                        else:
+                            # Production mode - HTTPS transmission
+                            if transmission_mgr.send_batch(payload):
+                                # Only advance checkpoint on successful transmission
+                                checkpoint_mgr.update_checkpoint(channel, max_record_id)
+                                checkpoint_mgr.save()
+                            else:
+                                # Save to fallback if transmission failed
+                                transmission_mgr.save_to_fallback(payload)
+                                print(f"  ⚠ Checkpoint NOT advanced for {channel} due to transmission failure")
+                        
+                        batch_events = []  # Clear for next channel
             
             cycle_duration = time.time() - cycle_start
-            print(f"Cycle complete: {total_events} total events in {cycle_duration:.2f}s")
+            print(f"Cycle complete in {cycle_duration:.2f}s\n")
             
             # Sleep until next cycle
             sleep_time = max(0, COLLECTION_INTERVAL_SECONDS - cycle_duration)

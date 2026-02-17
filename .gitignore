@@ -21,3 +21,7 @@ collected_logs/
 # System
 Thumbs.db
 Desktop.ini
+
+# Generated Reports
+collected_events.json
+event_summary.txt

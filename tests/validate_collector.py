@@ -235,7 +235,7 @@ def main():
     if all_passed:
         print("✓ All validation tests PASSED")
         print("\nCollector is ready to run. Start with:")
-        print("  python collector.py")
+        print("  python src/collector.py")
         return 0
     else:
         print("✗ Some validation tests FAILED")

@@ -25,3 +25,17 @@ Desktop.ini
 # Generated Reports
 collected_events.json
 event_summary.txt
+sentinel.pid
+sentinel.log
+live_test_report.txt
+live_test_output.txt
+test_results.txt
+.pytest_cache/
+
+# Risky / Sensitive Files
+.env
+*.env
+.env.local
+.env.*.local
+secrets.json
+config.local.json

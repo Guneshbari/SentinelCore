@@ -1,3 +1,4 @@
 pywin32>=306
 psutil>=5.9.0
 requests>=2.31.0
+pytest>=7.0.0

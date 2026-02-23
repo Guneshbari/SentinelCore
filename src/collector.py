@@ -1,6 +1,6 @@
 """
 SentinelCore - Production-grade Windows Telemetry Agent
-Version: 2.0.0
+Version: 3.0.0
 Focus: System Stability and Critical Fault Detection
 
 Uses modern Windows Eventing API (EvtQuery) for efficient event collection.
@@ -14,6 +14,11 @@ PRODUCTION FEATURES:
 - HTTPS transmission with exponential backoff retry
 - Checkpoint advancement only on successful transmission
 - Graceful handling of non-admin execution
+- Administrator privilege detection with channel probing
+- Error classification for fault diagnosis (7 fault types)
+- PID lock file to prevent duplicate instances
+- Disk space guard (pauses if < 1GB free)
+- File + console logging for headless operation
 """
 
 import json
@@ -23,8 +28,10 @@ import os
 import socket
 import hashlib
 import re
+import ctypes
+import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 from collections import deque
 import winreg
 import uuid
@@ -52,7 +59,11 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-COLLECTOR_VERSION = "2.0.0"
+COLLECTOR_VERSION = "3.0.0"
+
+# Resolve working directory to script location (important for Task Scheduler)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(SCRIPT_DIR)
 
 # Testing Mode - Set to True for local testing without server
 LOCAL_TESTING_MODE = os.getenv("SENTINEL_LOCAL_MODE", "true").lower() == "true"
@@ -94,6 +105,240 @@ PRETTY_PRINT_JSON = True  # Make JSON human-readable for analysis
 # Fallback Configuration (only for non-testing mode)
 ENABLE_LOCAL_FALLBACK = True  # Write to local file if HTTPS fails
 FALLBACK_FILE_PREFIX = "events_fallback"
+
+# Production Safety
+PID_LOCK_FILE = os.path.join(SCRIPT_DIR, "sentinel.pid")  # Prevents duplicate instances
+MIN_DISK_FREE_MB = 1024  # Pause collection if disk free < 1GB
+LOG_FILE = os.path.join(SCRIPT_DIR, "sentinel.log")  # Log output for headless operation
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE, encoding='utf-8')
+    ]
+)
+logger = logging.getLogger('SentinelCore')
+
+# ============================================================================
+# PID LOCK (prevents duplicate instances)
+# ============================================================================
+
+def acquire_pid_lock() -> bool:
+    """Create PID lock file. Returns False if another instance is running."""
+    if os.path.exists(PID_LOCK_FILE):
+        try:
+            with open(PID_LOCK_FILE, 'r') as f:
+                old_pid = int(f.read().strip())
+            # Check if that process is still running
+            if psutil.pid_exists(old_pid):
+                try:
+                    proc = psutil.Process(old_pid)
+                    if 'python' in proc.name().lower():
+                        print(f"ERROR: Another SentinelCore instance is running (PID {old_pid})", file=sys.stderr)
+                        print(f"  To force restart, delete: {PID_LOCK_FILE}", file=sys.stderr)
+                        return False
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass  # Process died, stale PID file
+        except (ValueError, IOError):
+            pass  # Corrupt PID file, overwrite it
+
+    # Write our PID
+    with open(PID_LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def release_pid_lock():
+    """Remove PID lock file on shutdown."""
+    try:
+        if os.path.exists(PID_LOCK_FILE):
+            os.remove(PID_LOCK_FILE)
+    except Exception:
+        pass
+
+
+def check_disk_space() -> bool:
+    """Check if there's enough disk space to continue. Returns True if OK."""
+    try:
+        disk = psutil.disk_usage(SCRIPT_DIR)
+        free_mb = disk.free / (1024 * 1024)
+        if free_mb < MIN_DISK_FREE_MB:
+            logger.warning(f"LOW DISK SPACE: {free_mb:.0f}MB free (minimum: {MIN_DISK_FREE_MB}MB). Pausing collection.")
+            return False
+        return True
+    except Exception:
+        return True  # Continue if we can't check
+
+# ============================================================================
+# ADMINISTRATOR PRIVILEGE DETECTION
+# ============================================================================
+
+def is_admin() -> bool:
+    """Check if the current process has Administrator privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def check_admin_privileges() -> Tuple[bool, List[str]]:
+    """
+    Check admin status and determine which channels are accessible.
+    Returns (is_admin, list_of_warnings).
+    """
+    admin = is_admin()
+    warnings = []
+
+    if not admin:
+        warnings.append(
+            "Running WITHOUT Administrator privileges. "
+            "Some event channels may be inaccessible."
+        )
+        # Probe each target channel to see which ones are accessible
+        try:
+            import win32evtlog
+            import pywintypes
+            for channel in TARGET_LOGS:
+                try:
+                    query = f"<QueryList><Query><Select Path='{channel}'>*[System[EventRecordID &gt; 999999999]]</Select></Query></QueryList>"
+                    handle = win32evtlog.EvtQuery(
+                        channel,
+                        win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryForwardDirection,
+                        query, None
+                    )
+                except pywintypes.error as e:
+                    if e.winerror in [5, 15001]:
+                        warnings.append(f"  ✗ Channel '{channel}' requires admin access")
+                    elif e.winerror == 15007:
+                        warnings.append(f"  ✗ Channel '{channel}' does not exist")
+        except ImportError:
+            pass
+
+        warnings.append(
+            "\nTo run as Administrator:\n"
+            "  1. Open PowerShell as Administrator\n"
+            "  2. Navigate to this directory\n"
+            "  3. Run: python collector.py"
+        )
+    return admin, warnings
+
+# ============================================================================
+# ERROR CLASSIFICATION FOR FAULT DIAGNOSIS
+# ============================================================================
+
+class ErrorClassifier:
+    """
+    Classifies collected events into fault categories for diagnosis.
+    Each event is tagged with a fault_type and fault_details dict.
+    """
+
+    FAULT_TYPES = {
+        'SYSTEM_FAULT': 'Critical system fault (crash, BSOD, unexpected shutdown)',
+        'DRIVER_ISSUE': 'Device driver failure or timeout',
+        'RESOURCE_WARNING': 'Resource exhaustion or performance degradation',
+        'SERVICE_ERROR': 'Windows service start/stop failure',
+        'SECURITY_EVENT': 'Permission violation or security-related event',
+        'UPDATE_ERROR': 'Windows Update failure',
+        'STORAGE_ERROR': 'Disk or volume shadow copy issues',
+        'UNKNOWN': 'Unclassified event'
+    }
+
+    # Pattern: (provider_substring, event_id_or_None) -> fault_type
+    CLASSIFICATION_RULES = [
+        # System faults
+        ('Kernel-Power', 41, 'SYSTEM_FAULT'),
+        ('Kernel-Power', 109, 'SYSTEM_FAULT'),
+        ('BugCheck', None, 'SYSTEM_FAULT'),
+        ('BlueScreen', None, 'SYSTEM_FAULT'),
+        ('WER-SystemErrorReporting', None, 'SYSTEM_FAULT'),
+        # Driver issues
+        ('Kernel-PnP', 219, 'DRIVER_ISSUE'),
+        ('DriverFrameworks', None, 'DRIVER_ISSUE'),
+        # Resource warnings
+        ('Kernel-Processor-Power', 37, 'RESOURCE_WARNING'),
+        ('disk', 153, 'RESOURCE_WARNING'),
+        ('Resource-Exhaustion', None, 'RESOURCE_WARNING'),
+        # Service errors
+        ('Service Control Manager', 7000, 'SERVICE_ERROR'),
+        ('Service Control Manager', 7001, 'SERVICE_ERROR'),
+        ('Service Control Manager', 7009, 'SERVICE_ERROR'),
+        ('Service Control Manager', 7023, 'SERVICE_ERROR'),
+        ('Service Control Manager', 7031, 'SERVICE_ERROR'),
+        ('Service Control Manager', 7034, 'SERVICE_ERROR'),
+        ('winsrvext', None, 'SERVICE_ERROR'),
+        # Security events
+        ('DistributedCOM', 10016, 'SECURITY_EVENT'),
+        # Update errors
+        ('WindowsUpdateClient', None, 'UPDATE_ERROR'),
+        # Storage errors
+        ('Volsnap', None, 'STORAGE_ERROR'),
+        ('Ntfs', None, 'STORAGE_ERROR'),
+    ]
+
+    @classmethod
+    def classify(cls, provider_name: str, event_id: int, level: int) -> Dict:
+        """
+        Classify an event and return fault info.
+        Returns dict with fault_type, fault_description, severity.
+        """
+        fault_type = 'UNKNOWN'
+        provider_lower = provider_name.lower() if provider_name else ''
+
+        for rule_provider, rule_eid, rule_type in cls.CLASSIFICATION_RULES:
+            if rule_provider.lower() in provider_lower:
+                if rule_eid is None or rule_eid == event_id:
+                    fault_type = rule_type
+                    break
+
+        # If still unknown, classify by severity level
+        if fault_type == 'UNKNOWN':
+            if level == 1:
+                fault_type = 'SYSTEM_FAULT'
+            elif level == 2:
+                fault_type = 'SERVICE_ERROR'
+
+        severity = {1: 'CRITICAL', 2: 'ERROR', 3: 'WARNING'}.get(level, 'INFO')
+
+        return {
+            'fault_type': fault_type,
+            'fault_description': cls.FAULT_TYPES.get(fault_type, 'Unknown'),
+            'severity': severity
+        }
+
+    @classmethod
+    def get_diagnostic_context(cls, event: Dict, resources: Dict) -> Dict:
+        """
+        Build diagnostic context for an event: resource state and process info.
+        """
+        context = {
+            'resource_state': {
+                'cpu_percent': resources.get('cpu_usage_percent', 0),
+                'memory_percent': resources.get('memory_usage_percent', 0),
+                'disk_free_percent': resources.get('disk_free_percent', 0)
+            },
+            'resource_alerts': []
+        }
+
+        # Flag resource anomalies at time of event capture
+        cpu = resources.get('cpu_usage_percent', 0)
+        mem = resources.get('memory_usage_percent', 0)
+        disk = resources.get('disk_free_percent', 100)
+
+        if cpu > 90:
+            context['resource_alerts'].append(f'HIGH CPU: {cpu}%')
+        if mem > 90:
+            context['resource_alerts'].append(f'HIGH MEMORY: {mem}%')
+        if disk < 10:
+            context['resource_alerts'].append(f'LOW DISK: {disk}% free')
+
+        return context
 
 # ============================================================================
 # SYSTEM METADATA FUNCTIONS
@@ -552,6 +797,23 @@ def run_collector():
     """Main collection loop"""
     print(f"SentinelCore v{COLLECTOR_VERSION} - Production Telemetry Agent")
     print("=" * 70)
+    print(f"Working Dir:    {SCRIPT_DIR}")
+    print(f"PID:            {os.getpid()}")
+
+    # Acquire PID lock (prevent duplicate instances)
+    if not acquire_pid_lock():
+        sys.exit(1)
+
+    # Check administrator privileges
+    admin_status, admin_warnings = check_admin_privileges()
+    privilege_level = "ADMINISTRATOR" if admin_status else "STANDARD USER"
+    print(f"Privileges:     {privilege_level}")
+
+    if admin_warnings:
+        print("")
+        for w in admin_warnings:
+            print(f"  ⚠ {w}")
+        print("")
     
     # Initialize system metadata
     system_id = get_system_id()
@@ -607,6 +869,12 @@ def run_collector():
             batch_events = []
             
             print(f"[Cycle {cycle_count}] {datetime.now(timezone.utc).isoformat()}")
+
+            # Disk space guard
+            if not check_disk_space():
+                print(f"  Skipping cycle (low disk space). Retrying in {COLLECTION_INTERVAL_SECONDS}s...")
+                time.sleep(COLLECTION_INTERVAL_SECONDS)
+                continue
             
             # Collect from target channels
             for channel in TARGET_LOGS:
@@ -633,6 +901,16 @@ def run_collector():
                         # Get resource snapshot
                         resources = get_resource_snapshot()
                         
+                        # Classify for fault diagnosis
+                        fault_info = ErrorClassifier.classify(
+                            event['metadata']['provider_name'],
+                            event['metadata']['event_id'],
+                            event['metadata']['level']
+                        )
+                        diag_context = ErrorClassifier.get_diagnostic_context(
+                            event['metadata'], resources
+                        )
+
                         # Build event payload
                         event_payload = {
                             'log_channel': event['log_channel'],
@@ -650,6 +928,10 @@ def run_collector():
                             'memory_usage_percent': resources['memory_usage_percent'],
                             'disk_free_percent': resources['disk_free_percent'],
                             'event_hash': event_hash,
+                            'fault_type': fault_info['fault_type'],
+                            'fault_description': fault_info['fault_description'],
+                            'severity': fault_info['severity'],
+                            'diagnostic_context': diag_context,
                             'raw_xml': event['raw_xml']
                         }
                         
@@ -706,6 +988,7 @@ def run_collector():
     except KeyboardInterrupt:
         print("\n\nGraceful shutdown initiated...")
         checkpoint_mgr.save()
+        release_pid_lock()
         print("Checkpoints saved")
         print(f"Total cycles completed: {cycle_count}")
         print("Shutdown complete")
@@ -714,6 +997,7 @@ def run_collector():
     except Exception as e:
         print(f"\nFatal error: {e}", file=sys.stderr)
         checkpoint_mgr.save()
+        release_pid_lock()
         sys.exit(1)
 
 

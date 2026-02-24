@@ -55,11 +55,18 @@ except ImportError:
     print("ERROR: requests is required. Install with: pip install requests", file=sys.stderr)
     sys.exit(1)
 
+try:
+    from kafka import KafkaProducer
+    from kafka.errors import KafkaError
+    HAS_KAFKA = True
+except ImportError:
+    HAS_KAFKA = False
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-COLLECTOR_VERSION = "3.0.0"
+COLLECTOR_VERSION = "3.1.0"
 
 # Resolve working directory to script location (important for Task Scheduler)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,7 +75,12 @@ os.chdir(SCRIPT_DIR)
 # Testing Mode - Set to True for local testing without server
 LOCAL_TESTING_MODE = os.getenv("SENTINEL_LOCAL_MODE", "true").lower() == "true"
 
-# Server Configuration (only used when LOCAL_TESTING_MODE = False)
+# Kafka Pipeline Mode (takes precedence over HTTPS when enabled)
+KAFKA_MODE = os.getenv("SENTINEL_KAFKA_MODE", "false").lower() == "true"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("SENTINEL_KAFKA_SERVERS", "localhost:9092")
+KAFKA_TOPIC = os.getenv("SENTINEL_KAFKA_TOPIC", "sentinel-events")
+
+# Server Configuration (only used when LOCAL_TESTING_MODE = False and KAFKA_MODE = False)
 SERVER_ENDPOINT = os.getenv("SENTINEL_SERVER_URL", "https://your-server.com/api/events")
 AUTH_TOKEN = os.getenv("SENTINEL_AUTH_TOKEN", None)  # Optional Bearer token
 REQUEST_TIMEOUT = 30  # seconds
@@ -641,6 +653,89 @@ class LocalFileManager:
             return False
 
 # ============================================================================
+# KAFKA MANAGER (for pipeline mode)
+# ============================================================================
+
+class KafkaManager:
+    """Handles Kafka event publishing for the data pipeline"""
+
+    def __init__(self, bootstrap_servers: str, topic: str):
+        if not HAS_KAFKA:
+            print("ERROR: kafka-python-ng is required for Kafka mode.", file=sys.stderr)
+            print("  Install with: pip install kafka-python-ng", file=sys.stderr)
+            sys.exit(1)
+
+        self.topic = topic
+        self.bootstrap_servers = bootstrap_servers
+        self.producer = None
+        self._connect()
+
+    def _connect(self):
+        """Connect to Kafka broker with retry"""
+        for attempt in range(MAX_RETRY_ATTEMPTS):
+            try:
+                self.producer = KafkaProducer(
+                    bootstrap_servers=self.bootstrap_servers,
+                    value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
+                    key_serializer=lambda k: k.encode('utf-8') if k else None,
+                    acks='all',
+                    retries=3,
+                    max_block_ms=10000,
+                    linger_ms=100,
+                    batch_size=32768
+                )
+                logger.info(f"Connected to Kafka at {self.bootstrap_servers}")
+                return
+            except Exception as e:
+                logger.error(f"Kafka connection failed (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS}): {e}")
+                if attempt < MAX_RETRY_ATTEMPTS - 1:
+                    time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+        print("ERROR: Could not connect to Kafka broker.", file=sys.stderr)
+        sys.exit(1)
+
+    def send_batch(self, payload: Dict) -> bool:
+        """Publish event batch to Kafka topic. Returns True if successful."""
+        try:
+            system_id = payload.get('system_id', 'unknown')
+            events = payload.get('events', [])
+
+            # Wrap each event with system metadata for the consumer
+            for event in events:
+                message = {
+                    'system_id': system_id,
+                    'hostname': payload.get('hostname'),
+                    'collector_version': payload.get('collector_version'),
+                    'timestamp_collected': payload.get('timestamp_collected'),
+                    'event': event
+                }
+                self.producer.send(
+                    self.topic,
+                    key=system_id,
+                    value=message
+                )
+
+            # Block until all messages are sent
+            self.producer.flush(timeout=30)
+            return True
+
+        except KafkaError as e:
+            logger.error(f"Kafka publish failed: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected Kafka error: {e}")
+            return False
+
+    def close(self):
+        """Flush and close the Kafka producer"""
+        if self.producer:
+            try:
+                self.producer.flush(timeout=10)
+                self.producer.close(timeout=10)
+                logger.info("Kafka producer closed gracefully")
+            except Exception as e:
+                logger.error(f"Error closing Kafka producer: {e}")
+
+# ============================================================================
 # TRANSMISSION MANAGER
 # ============================================================================
 
@@ -830,24 +925,39 @@ def run_collector():
     
     # Initialize managers
     checkpoint_mgr = CheckpointManager(CHECKPOINT_FILE)
-    
-    if LOCAL_TESTING_MODE:
+    kafka_mgr = None
+    file_mgr = None
+    transmission_mgr = None
+
+    if KAFKA_MODE:
+        # Use Kafka pipeline
+        kafka_mgr = KafkaManager(KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC)
+    elif LOCAL_TESTING_MODE:
         # Use local file output for testing
         file_mgr = LocalFileManager(LOCAL_OUTPUT_FILE)
-        transmission_mgr = None
     else:
         # Use HTTPS transmission for production
         transmission_mgr = TransmissionManager(SERVER_ENDPOINT, AUTH_TOKEN)
-        file_mgr = None
     
     # Duplicate detection
     seen_hashes: deque = deque(maxlen=DUPLICATE_HASH_WINDOW)
     
+    # Determine mode name
+    if KAFKA_MODE:
+        mode_name = 'KAFKA PIPELINE'
+    elif LOCAL_TESTING_MODE:
+        mode_name = 'LOCAL TESTING'
+    else:
+        mode_name = 'PRODUCTION'
+
     # Display configuration
-    print(f"\nMode:           {'LOCAL TESTING' if LOCAL_TESTING_MODE else 'PRODUCTION'}")
+    print(f"\nMode:           {mode_name}")
     print(f"Target Logs:    {', '.join(TARGET_LOGS)}")
     
-    if LOCAL_TESTING_MODE:
+    if KAFKA_MODE:
+        print(f"Kafka Broker:   {KAFKA_BOOTSTRAP_SERVERS}")
+        print(f"Kafka Topic:    {KAFKA_TOPIC}")
+    elif LOCAL_TESTING_MODE:
         print(f"Output File:    {LOCAL_OUTPUT_FILE}")
         print(f"Max Events:     {MAX_EVENTS_PER_FILE} per file")
         print(f"Format:         {'Pretty JSON' if PRETTY_PRINT_JSON else 'Compact JSON'}")
@@ -954,8 +1064,17 @@ def run_collector():
                             'events': batch_events
                         }
                         
-                        # Save batch (local file or HTTPS depending on mode)
-                        if LOCAL_TESTING_MODE:
+                        # Save batch (Kafka, local file, or HTTPS depending on mode)
+                        if KAFKA_MODE:
+                            # Kafka pipeline mode
+                            if kafka_mgr.send_batch(payload):
+                                print(f"  ✓ Published {len(batch_events)} events to Kafka topic '{KAFKA_TOPIC}'")
+                                checkpoint_mgr.update_checkpoint(channel, max_record_id)
+                                checkpoint_mgr.save()
+                            else:
+                                print(f"  ✗ Failed to publish to Kafka")
+                                print(f"  ⚠ Checkpoint NOT advanced for {channel} due to Kafka failure")
+                        elif LOCAL_TESTING_MODE:
                             # Local testing mode - write to file
                             if file_mgr.save_batch(payload):
                                 print(f"  ✓ Saved {len(batch_events)} events to {LOCAL_OUTPUT_FILE}")
@@ -988,6 +1107,8 @@ def run_collector():
     except KeyboardInterrupt:
         print("\n\nGraceful shutdown initiated...")
         checkpoint_mgr.save()
+        if kafka_mgr:
+            kafka_mgr.close()
         release_pid_lock()
         print("Checkpoints saved")
         print(f"Total cycles completed: {cycle_count}")
@@ -997,6 +1118,8 @@ def run_collector():
     except Exception as e:
         print(f"\nFatal error: {e}", file=sys.stderr)
         checkpoint_mgr.save()
+        if kafka_mgr:
+            kafka_mgr.close()
         release_pid_lock()
         sys.exit(1)
 

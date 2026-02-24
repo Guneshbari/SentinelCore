@@ -153,6 +153,43 @@ $env:SENTINEL_SERVER_URL = "https://your-server.com/api/events"
 python collector.py
 ```
 
+## Kafka Pipeline Mode
+
+To publish events to Kafka (requires WSL with Kafka + PostgreSQL running — see [WSL_KAFKA_POSTGRES_SETUP.md](WSL_KAFKA_POSTGRES_SETUP.md)):
+
+### 1. Start the Collector in Kafka Mode (Windows PowerShell)
+
+```powershell
+$env:SENTINEL_KAFKA_MODE = "true"
+$env:SENTINEL_LOCAL_MODE = "false"
+
+# Optional: custom broker address (default: localhost:9092)
+# $env:SENTINEL_KAFKA_SERVERS = "localhost:9092"
+
+python src/collector.py
+```
+
+### 2. Start the Consumer (WSL Terminal)
+
+```bash
+cd /mnt/c/ProgramData/LogCollector
+python3 src/kafka_to_postgres.py
+```
+
+**Optional environment overrides:**
+
+```bash
+export POSTGRES_PASSWORD="your_password"
+export KAFKA_GROUP_ID="my-consumer-group"
+```
+
+### 3. Verify Events in PostgreSQL
+
+```bash
+sudo -u postgres psql sentinel_logs -c "SELECT COUNT(*) FROM events;"
+sudo -u postgres psql sentinel_logs -c "SELECT fault_type, severity, COUNT(*) FROM events GROUP BY fault_type, severity;"
+```
+
 ## Tips for Testing
 
 1. **Start small**: Collect 100-200 events first to check filtering is correct

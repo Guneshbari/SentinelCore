@@ -1,8 +1,8 @@
 # SentinelCore - Production Windows Telemetry Agent
 
-A production-grade Windows telemetry agent focused on **System Stability, Critical Fault Detection, and ML Training Data Generation**. Uses the modern Windows Eventing API (EvtQuery) to collect high-value system events, categorizes them for diagnostic ML pipelines, and transmits them securely.
+A production-grade Windows telemetry agent focused on **System Stability, Critical Fault Detection, and ML Training Data Generation**. Uses the modern Windows Eventing API (EvtQuery) to collect high-value system events, categorizes them for diagnostic ML pipelines, and streams them through a Kafka → PostgreSQL data pipeline.
 
-## Features (v3.0.0)
+## Features (v3.1.0)
 
 ### Log Collection & Classification
 
@@ -18,6 +18,12 @@ A production-grade Windows telemetry agent focused on **System Stability, Critic
 - **Headless Logging**: Dual console + file (`sentinel.log`) logging.
 - **Service Deployment**: Fully automated PowerShell script registers the agent as a SYSTEM service via Windows Task Scheduler.
 
+### Data Pipeline (Kafka + PostgreSQL)
+
+- **Kafka Publishing**: Events streamed to Kafka topic `sentinel-events` via `kafka-python-ng`.
+- **PostgreSQL Consumer**: Standalone `kafka_to_postgres.py` script reads from Kafka and writes to PostgreSQL with idempotent dedup (`ON CONFLICT DO NOTHING`).
+- **Three Delivery Modes**: Local file (testing), Kafka pipeline, or HTTPS — switchable via environment variables.
+
 ### Data Integrity & Transmission
 
 - **Hardware-Tied Hashing**: SHA256 hashes for deduplication using `(raw_xml + machine_guid + record_id)`.
@@ -28,17 +34,20 @@ A production-grade Windows telemetry agent focused on **System Stability, Critic
 
 ```text
 SentinelCore/
-├── src/                      # Core agent log collection and analysis
-│   ├── collector.py          # Main log collection (v3.0.0)
-│   ├── analyze_logs.py       # Helper functions for log analysis
-│   └── enhanced_analyzer.py  # Advanced ML correlation framework
-├── tests/                    # End-to-end and live testing suite
-│   ├── test_e2e.py           # 46 E2E unit tests
-│   ├── test_live_errors.py   # Live testing against real Windows Event Log
-│   └── validate_collector.py # Pipeline dependency validator
-├── deploy/                   # Fully automated deployment tooling
-│   └── deploy_startup.ps1    # Registers agent as a SYSTEM service
-├── docs/                     # Documentation and Guides
+├── src/                          # Core agent and data pipeline
+│   ├── collector.py              # Main log collection (v3.1.0)
+│   ├── kafka_to_postgres.py      # Kafka → PostgreSQL consumer
+│   ├── analyze_logs.py           # Helper functions for log analysis
+│   └── enhanced_analyzer.py      # Advanced ML correlation framework
+├── tests/                        # End-to-end and live testing suite
+│   ├── test_e2e.py               # E2E unit tests
+│   ├── test_live_errors.py       # Live testing against real Windows Event Log
+│   └── validate_collector.py     # Pipeline dependency validator
+├── deploy/                       # Fully automated deployment tooling
+│   └── deploy_startup.ps1        # Registers agent as a SYSTEM service
+├── docs/                         # Documentation and Guides
+│   ├── LOCAL_TESTING_GUIDE.md    # Local testing and Kafka pipeline usage
+│   └── WSL_KAFKA_POSTGRES_SETUP.md  # WSL infrastructure setup
 └── README.md
 ```
 
@@ -65,6 +74,20 @@ Run the E2E test suite to verify the agent works on your specific machine archit
 pip install -r requirements.txt
 python -m pytest tests/test_e2e.py -v
 ```
+
+### Kafka Pipeline
+
+1. Set up Kafka + PostgreSQL in WSL (see [docs/WSL_KAFKA_POSTGRES_SETUP.md](docs/WSL_KAFKA_POSTGRES_SETUP.md))
+2. Start the collector in Kafka mode:
+   ```powershell
+   $env:SENTINEL_KAFKA_MODE = "true"
+   $env:SENTINEL_LOCAL_MODE = "false"
+   python src/collector.py
+   ```
+3. Start the consumer in WSL:
+   ```bash
+   python3 src/kafka_to_postgres.py
+   ```
 
 ## ML Target Schema
 

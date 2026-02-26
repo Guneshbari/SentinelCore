@@ -66,19 +66,61 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-COLLECTOR_VERSION = "3.1.0"
+COLLECTOR_VERSION = "4.0.0"
 
 # Resolve working directory to script location (important for Task Scheduler)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
 
+# Project root is one level up from src/
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+CONFIG_FILE = os.path.join(PROJECT_ROOT, "config.json")
+
+
+def load_config() -> Dict:
+    """Load configuration from config.json. Falls back to defaults if missing."""
+    defaults = {
+        "kafka": {
+            "bootstrap_servers": "<WSL_IP>:9092",
+            "topic": "sentinel-events",
+            "client_id": "windows-test-agent"
+        },
+        "agent": {
+            "system_id_mode": "AUTO",
+            "batch_size": 20,
+            "retry_attempts": 3,
+            "retry_backoff_seconds": 3
+        }
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                user_config = json.load(f)
+            # Merge: user values override defaults
+            for section in defaults:
+                if section in user_config:
+                    defaults[section].update(user_config[section])
+            print(f"Loaded configuration from {CONFIG_FILE}")
+        except Exception as e:
+            print(f"Warning: Could not load {CONFIG_FILE}: {e}. Using defaults.", file=sys.stderr)
+    else:
+        print(f"Warning: {CONFIG_FILE} not found. Using built-in defaults.", file=sys.stderr)
+    return defaults
+
+
+_CONFIG = load_config()
+
 # Testing Mode - Set to True for local testing without server
-LOCAL_TESTING_MODE = os.getenv("SENTINEL_LOCAL_MODE", "true").lower() == "true"
+LOCAL_TESTING_MODE = os.getenv("SENTINEL_LOCAL_MODE", "false").lower() == "true"
 
 # Kafka Pipeline Mode (takes precedence over HTTPS when enabled)
-KAFKA_MODE = os.getenv("SENTINEL_KAFKA_MODE", "false").lower() == "true"
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("SENTINEL_KAFKA_SERVERS", "localhost:9092")
-KAFKA_TOPIC = os.getenv("SENTINEL_KAFKA_TOPIC", "sentinel-events")
+# Defaults to true since Kafka is the primary pipeline
+KAFKA_MODE = os.getenv("SENTINEL_KAFKA_MODE", "true").lower() == "true"
+
+# Kafka settings from config.json; KAFKA_BOOTSTRAP env var overrides bootstrap_servers
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP", _CONFIG["kafka"]["bootstrap_servers"])
+KAFKA_TOPIC = _CONFIG["kafka"]["topic"]
+KAFKA_CLIENT_ID = _CONFIG["kafka"].get("client_id", "windows-test-agent")
 
 # Server Configuration (only used when LOCAL_TESTING_MODE = False and KAFKA_MODE = False)
 SERVER_ENDPOINT = os.getenv("SENTINEL_SERVER_URL", "https://your-server.com/api/events")
@@ -100,13 +142,13 @@ EXCLUDE_PROVIDER_KEYWORDS = [
 ]
 
 # Collection Behavior
-BATCH_SIZE = 1000
+BATCH_SIZE = _CONFIG["agent"]["batch_size"]
 COLLECTION_INTERVAL_SECONDS = 30
 CHECKPOINT_FILE = "checkpoint.json"
 
-# Retry Configuration
-MAX_RETRY_ATTEMPTS = 3
-RETRY_BACKOFF_BASE = 1.0  # seconds
+# Retry Configuration (from config.json)
+MAX_RETRY_ATTEMPTS = _CONFIG["agent"]["retry_attempts"]
+RETRY_BACKOFF_BASE = float(_CONFIG["agent"]["retry_backoff_seconds"])
 DUPLICATE_HASH_WINDOW = 10000  # Keep last N event hashes
 
 # Local File Output Configuration
@@ -357,7 +399,9 @@ class ErrorClassifier:
 # ============================================================================
 
 def get_system_id() -> str:
-    """Get unique system identifier from Windows Machine GUID"""
+    """Get unique system identifier. Uses hostname when system_id_mode is AUTO."""
+    if _CONFIG["agent"].get("system_id_mode") == "AUTO":
+        return socket.gethostname()
     try:
         key = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE,
@@ -656,8 +700,16 @@ class LocalFileManager:
 # KAFKA MANAGER (for pipeline mode)
 # ============================================================================
 
+# Read Kafka tuning from config.json (with safe defaults)
+KAFKA_ACKS = _CONFIG["kafka"].get("acks", "all")
+KAFKA_RETRIES = int(_CONFIG["kafka"].get("retries", 5))
+KAFKA_RETRY_BACKOFF_MS = int(_CONFIG["kafka"].get("retry_backoff_ms", 3000))
+KAFKA_LINGER_MS = int(_CONFIG["kafka"].get("linger_ms", 50))
+KAFKA_REQUEST_TIMEOUT_MS = int(_CONFIG["kafka"].get("request_timeout_ms", 15000))
+
+
 class KafkaManager:
-    """Handles Kafka event publishing for the data pipeline"""
+    """Handles Kafka event publishing with delivery confirmation and auto-reconnect."""
 
     def __init__(self, bootstrap_servers: str, topic: str):
         if not HAS_KAFKA:
@@ -668,62 +720,132 @@ class KafkaManager:
         self.topic = topic
         self.bootstrap_servers = bootstrap_servers
         self.producer = None
+        self._reconnect_attempt = 0
         self._connect()
 
     def _connect(self):
-        """Connect to Kafka broker with retry"""
+        """Connect to Kafka broker with retry. Sets self.producer=None on failure."""
         for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
                 self.producer = KafkaProducer(
                     bootstrap_servers=self.bootstrap_servers,
+                    client_id=KAFKA_CLIENT_ID,
                     value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
                     key_serializer=lambda k: k.encode('utf-8') if k else None,
-                    acks='all',
-                    retries=3,
-                    max_block_ms=10000,
-                    linger_ms=100,
+                    acks=KAFKA_ACKS,
+                    retries=KAFKA_RETRIES,
+                    retry_backoff_ms=KAFKA_RETRY_BACKOFF_MS,
+                    linger_ms=KAFKA_LINGER_MS,
+                    request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
+                    max_block_ms=KAFKA_REQUEST_TIMEOUT_MS,
                     batch_size=32768
                 )
-                logger.info(f"Connected to Kafka at {self.bootstrap_servers}")
+                logger.info(f"Connected to Kafka at {self.bootstrap_servers} "
+                            f"(acks={KAFKA_ACKS}, retries={KAFKA_RETRIES}, "
+                            f"linger_ms={KAFKA_LINGER_MS})")
+                self._reconnect_attempt = 0
                 return
             except Exception as e:
                 logger.error(f"Kafka connection failed (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS}): {e}")
                 if attempt < MAX_RETRY_ATTEMPTS - 1:
-                    time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
-        print("ERROR: Could not connect to Kafka broker.", file=sys.stderr)
-        sys.exit(1)
+                    backoff = RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.info(f"  Retrying in {backoff:.0f}s...")
+                    time.sleep(backoff)
+        logger.critical("Could not connect to Kafka broker after all retries. "
+                        "Will attempt lazy reconnection on next send.")
+        self.producer = None
 
-    def send_batch(self, payload: Dict) -> bool:
-        """Publish event batch to Kafka topic. Returns True if successful."""
+    def _ensure_connected(self) -> bool:
+        """Lazy reconnection: attempt to reconnect if producer is None.
+        Uses exponential backoff across calls to avoid hammering the broker."""
+        if self.producer is not None:
+            return True
+
+        self._reconnect_attempt += 1
+        backoff = min(RETRY_BACKOFF_BASE * (2 ** self._reconnect_attempt), 60)
+        logger.info(f"Kafka reconnection attempt {self._reconnect_attempt} "
+                    f"(backoff {backoff:.0f}s)...")
+        time.sleep(backoff)
+
+        try:
+            self.producer = KafkaProducer(
+                bootstrap_servers=self.bootstrap_servers,
+                client_id=KAFKA_CLIENT_ID,
+                value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
+                key_serializer=lambda k: k.encode('utf-8') if k else None,
+                acks=KAFKA_ACKS,
+                retries=KAFKA_RETRIES,
+                retry_backoff_ms=KAFKA_RETRY_BACKOFF_MS,
+                linger_ms=KAFKA_LINGER_MS,
+                request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
+                max_block_ms=KAFKA_REQUEST_TIMEOUT_MS,
+                batch_size=32768
+            )
+            logger.info(f"Reconnected to Kafka at {self.bootstrap_servers}")
+            self._reconnect_attempt = 0
+            return True
+        except Exception as e:
+            logger.error(f"Kafka reconnection failed: {e}")
+            self.producer = None
+            return False
+
+    def send_batch(self, payload: Dict) -> Dict:
+        """Publish event batch to Kafka with per-message delivery confirmation.
+
+        Returns dict: {'sent': N, 'failed': M, 'success': bool}
+        """
+        result = {'sent': 0, 'failed': 0, 'success': False}
+
+        if not self._ensure_connected():
+            result['failed'] = len(payload.get('events', []))
+            return result
+
         try:
             system_id = payload.get('system_id', 'unknown')
             events = payload.get('events', [])
 
-            # Wrap each event with system metadata for the consumer
             for event in events:
-                message = {
+                kafka_message = {
                     'system_id': system_id,
                     'hostname': payload.get('hostname'),
                     'collector_version': payload.get('collector_version'),
                     'timestamp_collected': payload.get('timestamp_collected'),
                     'event': event
                 }
-                self.producer.send(
-                    self.topic,
-                    key=system_id,
-                    value=message
-                )
+                try:
+                    future = self.producer.send(
+                        self.topic,
+                        key=system_id,
+                        value=kafka_message
+                    )
+                    # Block until this message is confirmed by broker
+                    future.get(timeout=10)
+                    result['sent'] += 1
+                except KafkaError as e:
+                    result['failed'] += 1
+                    logger.error(f"Delivery failed for event "
+                                 f"{event.get('event_hash', '?')[:12]}: {e}")
+                except Exception as e:
+                    result['failed'] += 1
+                    logger.error(f"Unexpected delivery error for event "
+                                 f"{event.get('event_hash', '?')[:12]}: {e}")
 
-            # Block until all messages are sent
+            # Flush any remaining buffered messages
             self.producer.flush(timeout=30)
-            return True
+
+            result['success'] = result['failed'] == 0
+            return result
 
         except KafkaError as e:
-            logger.error(f"Kafka publish failed: {e}")
-            return False
+            logger.error(f"Kafka batch send failed: {e}")
+            self.producer = None  # Mark for reconnection
+            result['failed'] = len(payload.get('events', [])) - result['sent']
+            return result
         except Exception as e:
-            logger.error(f"Unexpected Kafka error: {e}")
-            return False
+            logger.error(f"Unexpected Kafka error during batch send: {e}")
+            self.producer = None
+            result['failed'] = len(payload.get('events', [])) - result['sent']
+            return result
 
     def close(self):
         """Flush and close the Kafka producer"""
@@ -1021,13 +1143,15 @@ def run_collector():
                             event['metadata'], resources
                         )
 
-                        # Build event payload
+                        # Build event payload with required structured fields
+                        severity_map = {1: 'CRITICAL', 2: 'ERROR', 3: 'WARNING', 4: 'INFO', 5: 'VERBOSE'}
+                        event_level = event['metadata']['level']
                         event_payload = {
                             'log_channel': event['log_channel'],
                             'event_record_id': event['metadata']['event_record_id'],
                             'provider_name': event['metadata']['provider_name'],
                             'event_id': event['metadata']['event_id'],
-                            'level': event['metadata']['level'],
+                            'level': event_level,
                             'task': event['metadata']['task'],
                             'opcode': event['metadata']['opcode'],
                             'keywords': event['metadata']['keywords'],
@@ -1040,7 +1164,10 @@ def run_collector():
                             'event_hash': event_hash,
                             'fault_type': fault_info['fault_type'],
                             'fault_description': fault_info['fault_description'],
-                            'severity': fault_info['severity'],
+                            'severity': severity_map.get(event_level, fault_info['severity']),
+                            'message': f"{event['metadata']['provider_name']} Event {event['metadata']['event_id']} "
+                                       f"({severity_map.get(event_level, 'UNKNOWN')}) on channel {event['log_channel']}",
+                            'created_at': datetime.now(timezone.utc).isoformat(),
                             'diagnostic_context': diag_context,
                             'raw_xml': event['raw_xml']
                         }
@@ -1066,14 +1193,22 @@ def run_collector():
                         
                         # Save batch (Kafka, local file, or HTTPS depending on mode)
                         if KAFKA_MODE:
-                            # Kafka pipeline mode
-                            if kafka_mgr.send_batch(payload):
-                                print(f"  ✓ Published {len(batch_events)} events to Kafka topic '{KAFKA_TOPIC}'")
+                            # Kafka pipeline mode with delivery confirmation
+                            send_result = kafka_mgr.send_batch(payload)
+                            if send_result['success']:
+                                logger.info(f"  ✓ Published {send_result['sent']} events "
+                                            f"to Kafka topic '{KAFKA_TOPIC}'")
                                 checkpoint_mgr.update_checkpoint(channel, max_record_id)
                                 checkpoint_mgr.save()
+                            elif send_result['sent'] > 0:
+                                logger.warning(f"  ⚠ Partial publish: {send_result['sent']} sent, "
+                                               f"{send_result['failed']} failed")
+                                logger.warning(f"  ⚠ Checkpoint NOT advanced for {channel} "
+                                               f"due to partial Kafka failure")
                             else:
-                                print(f"  ✗ Failed to publish to Kafka")
-                                print(f"  ⚠ Checkpoint NOT advanced for {channel} due to Kafka failure")
+                                logger.error(f"  ✗ Failed to publish any events to Kafka")
+                                logger.error(f"  ⚠ Checkpoint NOT advanced for {channel} "
+                                             f"due to Kafka failure")
                         elif LOCAL_TESTING_MODE:
                             # Local testing mode - write to file
                             if file_mgr.save_batch(payload):

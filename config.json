@@ -1,0 +1,18 @@
+{
+  "kafka": {
+    "bootstrap_servers": "172.30.178.75:9092",
+    "topic": "sentinel-events",
+    "client_id": "windows-test-agent",
+    "acks": "all",
+    "retries": 5,
+    "retry_backoff_ms": 3000,
+    "linger_ms": 50,
+    "request_timeout_ms": 15000
+  },
+  "agent": {
+    "system_id_mode": "AUTO",
+    "batch_size": 20,
+    "retry_attempts": 3,
+    "retry_backoff_seconds": 3
+  }
+}

@@ -1,6 +1,11 @@
-pywin32>=306
+# Windows Log Collector Dependencies
+pywin32>=306; sys_platform == 'win32'
 psutil>=5.9.0
 requests>=2.31.0
+
+# Testing
 pytest>=7.0.0
+
+# Kafka to PostgreSQL Consumer Dependencies
 kafka-python-ng>=2.2.0
 psycopg2-binary>=2.9.0

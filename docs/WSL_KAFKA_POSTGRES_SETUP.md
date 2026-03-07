@@ -108,9 +108,30 @@ bin/kafka-topics.sh --create --topic sentinel-events --bootstrap-server localhos
 
 ---
 
+## 4. Kafka Network Configuration for Windows Access
+
+By default, Kafka only listens on `localhost` inside WSL. To allow the Windows collector to connect, you must update `server.properties`:
+
+```bash
+nano ~/kafka_2.13-4.2.0/config/kraft/server.properties
+```
+
+Find and set these properties (replace `<WSL_IP>` with output of `hostname -I`):
+
+```properties
+listeners=PLAINTEXT://0.0.0.0:9092
+advertised.listeners=PLAINTEXT://<WSL_IP>:9092
+```
+
+> **Important:** The WSL IP can change after a reboot. Re-check with `hostname -I` and update both `server.properties` and your `config.json` if it changes.
+
+After making changes, restart Kafka for them to take effect.
+
+---
+
 ## Next Steps: Python Integration
 
-Now that the WSL infrastructure is running on `localhost:5432` (Postgres) and `localhost:9092` (Kafka), the next phase is writing the Python code to connect them:
+Now that the WSL infrastructure is running on `localhost:5432` (Postgres) and `<WSL_IP>:9092` (Kafka), the next phase is connecting the Python pipeline:
 
-1. **Windows-side:** Update SentinelCore to publish to `localhost:9092`.
-2. **WSL-side:** A Python consumer script (`kafka_to_postgres.py`) will listen to that topic and `INSERT INTO events`.
+1. **Windows-side:** SentinelCore reads `config.json` and publishes to the WSL Kafka broker.
+2. **WSL-side:** The consumer script (`kafka_to_postgres.py`) listens on the topic and inserts events into PostgreSQL.

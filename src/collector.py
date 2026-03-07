@@ -1,24 +1,15 @@
 """
 SentinelCore - Production-grade Windows Telemetry Agent
-Version: 3.0.0
-Focus: System Stability and Critical Fault Detection
+Version: 4.0.0
 
-Uses modern Windows Eventing API (EvtQuery) for efficient event collection.
-Sends structured, integrity-safe data to Linux server via HTTPS.
-
-PRODUCTION FEATURES:
-- Targeted log collection (System, Kernel-Power, DriverFrameworks)
-- Multi-level event filtering (level, provider name)
-- SHA256 integrity hashing for duplicate detection
-- System resource monitoring (CPU, memory, disk)
-- HTTPS transmission with exponential backoff retry
-- Checkpoint advancement only on successful transmission
-- Graceful handling of non-admin execution
-- Administrator privilege detection with channel probing
-- Error classification for fault diagnosis (7 fault types)
-- PID lock file to prevent duplicate instances
-- Disk space guard (pauses if < 1GB free)
-- File + console logging for headless operation
+CHANGES FROM v3:
+- Strategy pattern replaces inline mode branching
+- Resource snapshot moved outside event loop (was per-event)
+- Checkpoint saved once per cycle (was per-channel)
+- ErrorClassifier replaced with module-level functions
+- Removed os.chdir() — all paths are now absolute
+- Dead HTTPS path clearly separated from Kafka pipeline
+- Version string unified
 """
 
 import json
@@ -30,8 +21,9 @@ import hashlib
 import re
 import ctypes
 import logging
+from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional, Tuple
 from collections import deque
 import winreg
 import uuid
@@ -40,19 +32,19 @@ try:
     import win32evtlog
     import pywintypes
 except ImportError:
-    print("ERROR: pywin32 is required. Install with: pip install pywin32", file=sys.stderr)
+    print("ERROR: pywin32 required. pip install pywin32", file=sys.stderr)
     sys.exit(1)
 
 try:
     import psutil
 except ImportError:
-    print("ERROR: psutil is required. Install with: pip install psutil", file=sys.stderr)
+    print("ERROR: psutil required. pip install psutil", file=sys.stderr)
     sys.exit(1)
 
 try:
     import requests
 except ImportError:
-    print("ERROR: requests is required. Install with: pip install requests", file=sys.stderr)
+    print("ERROR: requests required. pip install requests", file=sys.stderr)
     sys.exit(1)
 
 try:
@@ -63,27 +55,37 @@ except ImportError:
     HAS_KAFKA = False
 
 # ============================================================================
-# CONFIGURATION
+# CONSTANTS
 # ============================================================================
 
 COLLECTOR_VERSION = "4.0.0"
-
-# Resolve working directory to script location (important for Task Scheduler)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(SCRIPT_DIR)
-
-# Project root is one level up from src/
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 CONFIG_FILE = os.path.join(PROJECT_ROOT, "config.json")
 
+LEVEL_NAMES = {1: 'CRITICAL', 2: 'ERROR', 3: 'WARNING', 4: 'INFO', 5: 'VERBOSE'}
+
+# Resource alert thresholds
+CPU_ALERT_THRESHOLD    = 90   # percent
+MEMORY_ALERT_THRESHOLD = 90   # percent
+DISK_LOW_THRESHOLD     = 10   # percent free
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
 def load_config() -> Dict:
-    """Load configuration from config.json. Falls back to defaults if missing."""
+    """Load config.json, falling back to built-in defaults."""
     defaults = {
         "kafka": {
             "bootstrap_servers": "<WSL_IP>:9092",
             "topic": "sentinel-events",
-            "client_id": "windows-test-agent"
+            "client_id": "windows-test-agent",
+            "acks": "all",
+            "retries": 5,
+            "retry_backoff_ms": 3000,
+            "linger_ms": 50,
+            "request_timeout_ms": 15000
         },
         "agent": {
             "system_id_mode": "AUTO",
@@ -96,11 +98,10 @@ def load_config() -> Dict:
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 user_config = json.load(f)
-            # Merge: user values override defaults
             for section in defaults:
                 if section in user_config:
                     defaults[section].update(user_config[section])
-            print(f"Loaded configuration from {CONFIG_FILE}")
+            print(f"Loaded config from {CONFIG_FILE}")
         except Exception as e:
             print(f"Warning: Could not load {CONFIG_FILE}: {e}. Using defaults.", file=sys.stderr)
     else:
@@ -110,63 +111,56 @@ def load_config() -> Dict:
 
 _CONFIG = load_config()
 
-# Testing Mode - Set to True for local testing without server
+# Output mode (resolved once at startup)
 LOCAL_TESTING_MODE = os.getenv("SENTINEL_LOCAL_MODE", "false").lower() == "true"
+KAFKA_MODE          = os.getenv("SENTINEL_KAFKA_MODE", "true").lower() == "true"
 
-# Kafka Pipeline Mode (takes precedence over HTTPS when enabled)
-# Defaults to true since Kafka is the primary pipeline
-KAFKA_MODE = os.getenv("SENTINEL_KAFKA_MODE", "true").lower() == "true"
+# Kafka
+KAFKA_BOOTSTRAP_SERVERS  = os.getenv("KAFKA_BOOTSTRAP", _CONFIG["kafka"]["bootstrap_servers"])
+KAFKA_TOPIC              = _CONFIG["kafka"]["topic"]
+KAFKA_CLIENT_ID          = _CONFIG["kafka"]["client_id"]
+KAFKA_ACKS               = _CONFIG["kafka"]["acks"]
+KAFKA_RETRIES            = int(_CONFIG["kafka"]["retries"])
+KAFKA_RETRY_BACKOFF_MS   = int(_CONFIG["kafka"]["retry_backoff_ms"])
+KAFKA_LINGER_MS          = int(_CONFIG["kafka"]["linger_ms"])
+KAFKA_REQUEST_TIMEOUT_MS = int(_CONFIG["kafka"]["request_timeout_ms"])
 
-# Kafka settings from config.json; KAFKA_BOOTSTRAP env var overrides bootstrap_servers
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP", _CONFIG["kafka"]["bootstrap_servers"])
-KAFKA_TOPIC = _CONFIG["kafka"]["topic"]
-KAFKA_CLIENT_ID = _CONFIG["kafka"].get("client_id", "windows-test-agent")
+# HTTPS (only active when KAFKA_MODE=false and LOCAL_TESTING_MODE=false)
+SERVER_ENDPOINT       = os.getenv("SENTINEL_SERVER_URL", "https://your-server.com/api/events")
+AUTH_TOKEN            = os.getenv("SENTINEL_AUTH_TOKEN", None)
+REQUEST_TIMEOUT       = 30
+ENABLE_LOCAL_FALLBACK = True
+FALLBACK_FILE_PREFIX  = os.path.join(SCRIPT_DIR, "events_fallback")
 
-# Server Configuration (only used when LOCAL_TESTING_MODE = False and KAFKA_MODE = False)
-SERVER_ENDPOINT = os.getenv("SENTINEL_SERVER_URL", "https://your-server.com/api/events")
-AUTH_TOKEN = os.getenv("SENTINEL_AUTH_TOKEN", None)  # Optional Bearer token
-REQUEST_TIMEOUT = 30  # seconds
-
-# Collection Configuration
+# Collection
 TARGET_LOGS = [
     "System",
     "Microsoft-Windows-Kernel-Power",
     "Microsoft-Windows-DriverFrameworks-UserMode/Operational"
 ]
-
-# Event Filtering
-INCLUDE_LEVELS = [1, 2, 3]  # Critical=1, Error=2, Warning=3
+INCLUDE_LEVELS = [1, 2, 3]
 EXCLUDE_PROVIDER_KEYWORDS = [
     "tcpip", "dns", "dhcp", "wlan", "smb", "network",
     "firewall", "winhttp", "wininet"
 ]
-
-# Collection Behavior
-BATCH_SIZE = _CONFIG["agent"]["batch_size"]
+BATCH_SIZE                  = _CONFIG["agent"]["batch_size"]
 COLLECTION_INTERVAL_SECONDS = 30
-CHECKPOINT_FILE = "checkpoint.json"
+CHECKPOINT_FILE             = os.path.join(SCRIPT_DIR, "checkpoint.json")
+MAX_RETRY_ATTEMPTS          = _CONFIG["agent"]["retry_attempts"]
+RETRY_BACKOFF_BASE          = float(_CONFIG["agent"]["retry_backoff_seconds"])
+DUPLICATE_HASH_WINDOW       = 10000
 
-# Retry Configuration (from config.json)
-MAX_RETRY_ATTEMPTS = _CONFIG["agent"]["retry_attempts"]
-RETRY_BACKOFF_BASE = float(_CONFIG["agent"]["retry_backoff_seconds"])
-DUPLICATE_HASH_WINDOW = 10000  # Keep last N event hashes
+# Local file output
+LOCAL_OUTPUT_FILE    = os.path.join(SCRIPT_DIR, "collected_events.json")
+MAX_EVENTS_PER_FILE  = 500
 
-# Local File Output Configuration
-LOCAL_OUTPUT_FILE = "collected_events.json"  # Output file for local testing
-MAX_EVENTS_PER_FILE = 500  # Limit events per file to keep size manageable
-PRETTY_PRINT_JSON = True  # Make JSON human-readable for analysis
-
-# Fallback Configuration (only for non-testing mode)
-ENABLE_LOCAL_FALLBACK = True  # Write to local file if HTTPS fails
-FALLBACK_FILE_PREFIX = "events_fallback"
-
-# Production Safety
-PID_LOCK_FILE = os.path.join(SCRIPT_DIR, "sentinel.pid")  # Prevents duplicate instances
-MIN_DISK_FREE_MB = 1024  # Pause collection if disk free < 1GB
-LOG_FILE = os.path.join(SCRIPT_DIR, "sentinel.log")  # Log output for headless operation
+# Safety
+PID_LOCK_FILE   = os.path.join(SCRIPT_DIR, "sentinel.pid")
+MIN_DISK_FREE_MB = 1024
+LOG_FILE         = os.path.join(SCRIPT_DIR, "sentinel.log")
 
 # ============================================================================
-# LOGGING SETUP
+# LOGGING
 # ============================================================================
 
 logging.basicConfig(
@@ -181,36 +175,30 @@ logging.basicConfig(
 logger = logging.getLogger('SentinelCore')
 
 # ============================================================================
-# PID LOCK (prevents duplicate instances)
+# PID LOCK
 # ============================================================================
 
 def acquire_pid_lock() -> bool:
-    """Create PID lock file. Returns False if another instance is running."""
     if os.path.exists(PID_LOCK_FILE):
         try:
             with open(PID_LOCK_FILE, 'r') as f:
                 old_pid = int(f.read().strip())
-            # Check if that process is still running
             if psutil.pid_exists(old_pid):
                 try:
-                    proc = psutil.Process(old_pid)
-                    if 'python' in proc.name().lower():
-                        print(f"ERROR: Another SentinelCore instance is running (PID {old_pid})", file=sys.stderr)
-                        print(f"  To force restart, delete: {PID_LOCK_FILE}", file=sys.stderr)
+                    if 'python' in psutil.Process(old_pid).name().lower():
+                        print(f"ERROR: Another instance running (PID {old_pid}). Delete {PID_LOCK_FILE} to force restart.", file=sys.stderr)
                         return False
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass  # Process died, stale PID file
+                    pass
         except (ValueError, IOError):
-            pass  # Corrupt PID file, overwrite it
+            pass
 
-    # Write our PID
     with open(PID_LOCK_FILE, 'w') as f:
         f.write(str(os.getpid()))
     return True
 
 
 def release_pid_lock():
-    """Remove PID lock file on shutdown."""
     try:
         if os.path.exists(PID_LOCK_FILE):
             os.remove(PID_LOCK_FILE)
@@ -219,23 +207,20 @@ def release_pid_lock():
 
 
 def check_disk_space() -> bool:
-    """Check if there's enough disk space to continue. Returns True if OK."""
     try:
-        disk = psutil.disk_usage(SCRIPT_DIR)
-        free_mb = disk.free / (1024 * 1024)
+        free_mb = psutil.disk_usage(SCRIPT_DIR).free / (1024 * 1024)
         if free_mb < MIN_DISK_FREE_MB:
-            logger.warning(f"LOW DISK SPACE: {free_mb:.0f}MB free (minimum: {MIN_DISK_FREE_MB}MB). Pausing collection.")
+            logger.warning(f"LOW DISK: {free_mb:.0f}MB free (min: {MIN_DISK_FREE_MB}MB). Pausing.")
             return False
         return True
     except Exception:
-        return True  # Continue if we can't check
+        return True
 
 # ============================================================================
-# ADMINISTRATOR PRIVILEGE DETECTION
+# ADMIN PRIVILEGE DETECTION
 # ============================================================================
 
 def is_admin() -> bool:
-    """Check if the current process has Administrator privileges."""
     try:
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
     except Exception:
@@ -243,767 +228,577 @@ def is_admin() -> bool:
 
 
 def check_admin_privileges() -> Tuple[bool, List[str]]:
-    """
-    Check admin status and determine which channels are accessible.
-    Returns (is_admin, list_of_warnings).
-    """
     admin = is_admin()
     warnings = []
-
     if not admin:
-        warnings.append(
-            "Running WITHOUT Administrator privileges. "
-            "Some event channels may be inaccessible."
-        )
-        # Probe each target channel to see which ones are accessible
-        try:
-            import win32evtlog
-            import pywintypes
-            for channel in TARGET_LOGS:
-                try:
-                    query = f"<QueryList><Query><Select Path='{channel}'>*[System[EventRecordID &gt; 999999999]]</Select></Query></QueryList>"
-                    handle = win32evtlog.EvtQuery(
-                        channel,
-                        win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryForwardDirection,
-                        query, None
-                    )
-                except pywintypes.error as e:
-                    if e.winerror in [5, 15001]:
-                        warnings.append(f"  ✗ Channel '{channel}' requires admin access")
-                    elif e.winerror == 15007:
-                        warnings.append(f"  ✗ Channel '{channel}' does not exist")
-        except ImportError:
-            pass
-
-        warnings.append(
-            "\nTo run as Administrator:\n"
-            "  1. Open PowerShell as Administrator\n"
-            "  2. Navigate to this directory\n"
-            "  3. Run: python collector.py"
-        )
+        warnings.append("Running WITHOUT Administrator privileges. Some channels may be inaccessible.")
+        for channel in TARGET_LOGS:
+            try:
+                query = f"<QueryList><Query><Select Path='{channel}'>*[System[EventRecordID &gt; 999999999]]</Select></Query></QueryList>"
+                win32evtlog.EvtQuery(channel, win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryForwardDirection, query, None)
+            except pywintypes.error as e:
+                if e.winerror in [5, 15001]:
+                    warnings.append(f"  ✗ Channel '{channel}' requires admin access")
+                elif e.winerror == 15007:
+                    warnings.append(f"  ✗ Channel '{channel}' does not exist")
+        warnings.append("\nTo run as admin: open PowerShell as Administrator and run: python collector.py")
     return admin, warnings
 
 # ============================================================================
-# ERROR CLASSIFICATION FOR FAULT DIAGNOSIS
+# ERROR CLASSIFICATION (module-level functions, not a class)
 # ============================================================================
 
-class ErrorClassifier:
-    """
-    Classifies collected events into fault categories for diagnosis.
-    Each event is tagged with a fault_type and fault_details dict.
-    """
+_FAULT_DESCRIPTIONS = {
+    'SYSTEM_FAULT':      'Critical system fault (crash, BSOD, unexpected shutdown)',
+    'DRIVER_ISSUE':      'Device driver failure or timeout',
+    'RESOURCE_WARNING':  'Resource exhaustion or performance degradation',
+    'SERVICE_ERROR':     'Windows service start/stop failure',
+    'SECURITY_EVENT':    'Permission violation or security-related event',
+    'UPDATE_ERROR':      'Windows Update failure',
+    'STORAGE_ERROR':     'Disk or volume shadow copy issues',
+    'UNKNOWN':           'Unclassified event'
+}
 
-    FAULT_TYPES = {
-        'SYSTEM_FAULT': 'Critical system fault (crash, BSOD, unexpected shutdown)',
-        'DRIVER_ISSUE': 'Device driver failure or timeout',
-        'RESOURCE_WARNING': 'Resource exhaustion or performance degradation',
-        'SERVICE_ERROR': 'Windows service start/stop failure',
-        'SECURITY_EVENT': 'Permission violation or security-related event',
-        'UPDATE_ERROR': 'Windows Update failure',
-        'STORAGE_ERROR': 'Disk or volume shadow copy issues',
-        'UNKNOWN': 'Unclassified event'
+# (provider_substring, event_id_or_None) -> fault_type
+_CLASSIFICATION_RULES = [
+    ('Kernel-Power', 41,                   'SYSTEM_FAULT'),
+    ('Kernel-Power', 109,                  'SYSTEM_FAULT'),
+    ('BugCheck', None,                     'SYSTEM_FAULT'),
+    ('BlueScreen', None,                   'SYSTEM_FAULT'),
+    ('WER-SystemErrorReporting', None,     'SYSTEM_FAULT'),
+    ('Kernel-PnP', 219,                    'DRIVER_ISSUE'),
+    ('DriverFrameworks', None,             'DRIVER_ISSUE'),
+    ('Kernel-Processor-Power', 37,         'RESOURCE_WARNING'),
+    ('disk', 153,                          'RESOURCE_WARNING'),
+    ('Resource-Exhaustion', None,          'RESOURCE_WARNING'),
+    ('Service Control Manager', 7000,      'SERVICE_ERROR'),
+    ('Service Control Manager', 7001,      'SERVICE_ERROR'),
+    ('Service Control Manager', 7009,      'SERVICE_ERROR'),
+    ('Service Control Manager', 7023,      'SERVICE_ERROR'),
+    ('Service Control Manager', 7031,      'SERVICE_ERROR'),
+    ('Service Control Manager', 7034,      'SERVICE_ERROR'),
+    ('winsrvext', None,                    'SERVICE_ERROR'),
+    ('DistributedCOM', 10016,              'SECURITY_EVENT'),
+    ('WindowsUpdateClient', None,          'UPDATE_ERROR'),
+    ('Volsnap', None,                      'STORAGE_ERROR'),
+    ('Ntfs', None,                         'STORAGE_ERROR'),
+]
+
+
+def classify_event(provider_name: str, event_id: int, level: int) -> Dict:
+    """Classify an event and return fault_type, fault_description, severity."""
+    fault_type = 'UNKNOWN'
+    provider_lower = (provider_name or '').lower()
+
+    for rule_provider, rule_eid, rule_type in _CLASSIFICATION_RULES:
+        if rule_provider.lower() in provider_lower:
+            if rule_eid is None or rule_eid == event_id:
+                fault_type = rule_type
+                break
+
+    if fault_type == 'UNKNOWN':
+        fault_type = 'SYSTEM_FAULT' if level == 1 else 'SERVICE_ERROR' if level == 2 else 'UNKNOWN'
+
+    return {
+        'fault_type': fault_type,
+        'fault_description': _FAULT_DESCRIPTIONS.get(fault_type, 'Unknown'),
+        'severity': LEVEL_NAMES.get(level, 'INFO')
     }
 
-    # Pattern: (provider_substring, event_id_or_None) -> fault_type
-    CLASSIFICATION_RULES = [
-        # System faults
-        ('Kernel-Power', 41, 'SYSTEM_FAULT'),
-        ('Kernel-Power', 109, 'SYSTEM_FAULT'),
-        ('BugCheck', None, 'SYSTEM_FAULT'),
-        ('BlueScreen', None, 'SYSTEM_FAULT'),
-        ('WER-SystemErrorReporting', None, 'SYSTEM_FAULT'),
-        # Driver issues
-        ('Kernel-PnP', 219, 'DRIVER_ISSUE'),
-        ('DriverFrameworks', None, 'DRIVER_ISSUE'),
-        # Resource warnings
-        ('Kernel-Processor-Power', 37, 'RESOURCE_WARNING'),
-        ('disk', 153, 'RESOURCE_WARNING'),
-        ('Resource-Exhaustion', None, 'RESOURCE_WARNING'),
-        # Service errors
-        ('Service Control Manager', 7000, 'SERVICE_ERROR'),
-        ('Service Control Manager', 7001, 'SERVICE_ERROR'),
-        ('Service Control Manager', 7009, 'SERVICE_ERROR'),
-        ('Service Control Manager', 7023, 'SERVICE_ERROR'),
-        ('Service Control Manager', 7031, 'SERVICE_ERROR'),
-        ('Service Control Manager', 7034, 'SERVICE_ERROR'),
-        ('winsrvext', None, 'SERVICE_ERROR'),
-        # Security events
-        ('DistributedCOM', 10016, 'SECURITY_EVENT'),
-        # Update errors
-        ('WindowsUpdateClient', None, 'UPDATE_ERROR'),
-        # Storage errors
-        ('Volsnap', None, 'STORAGE_ERROR'),
-        ('Ntfs', None, 'STORAGE_ERROR'),
-    ]
 
-    @classmethod
-    def classify(cls, provider_name: str, event_id: int, level: int) -> Dict:
-        """
-        Classify an event and return fault info.
-        Returns dict with fault_type, fault_description, severity.
-        """
-        fault_type = 'UNKNOWN'
-        provider_lower = provider_name.lower() if provider_name else ''
+def build_diagnostic_context(resources: Dict) -> Dict:
+    """Build diagnostic context from a resource snapshot."""
+    cpu  = resources.get('cpu_usage_percent', 0)
+    mem  = resources.get('memory_usage_percent', 0)
+    disk = resources.get('disk_free_percent', 100)
 
-        for rule_provider, rule_eid, rule_type in cls.CLASSIFICATION_RULES:
-            if rule_provider.lower() in provider_lower:
-                if rule_eid is None or rule_eid == event_id:
-                    fault_type = rule_type
-                    break
+    alerts = []
+    if cpu  > CPU_ALERT_THRESHOLD:    alerts.append(f'HIGH CPU: {cpu}%')
+    if mem  > MEMORY_ALERT_THRESHOLD: alerts.append(f'HIGH MEMORY: {mem}%')
+    if disk < DISK_LOW_THRESHOLD:     alerts.append(f'LOW DISK: {disk}% free')
 
-        # If still unknown, classify by severity level
-        if fault_type == 'UNKNOWN':
-            if level == 1:
-                fault_type = 'SYSTEM_FAULT'
-            elif level == 2:
-                fault_type = 'SERVICE_ERROR'
-
-        severity = {1: 'CRITICAL', 2: 'ERROR', 3: 'WARNING'}.get(level, 'INFO')
-
-        return {
-            'fault_type': fault_type,
-            'fault_description': cls.FAULT_TYPES.get(fault_type, 'Unknown'),
-            'severity': severity
-        }
-
-    @classmethod
-    def get_diagnostic_context(cls, event: Dict, resources: Dict) -> Dict:
-        """
-        Build diagnostic context for an event: resource state and process info.
-        """
-        context = {
-            'resource_state': {
-                'cpu_percent': resources.get('cpu_usage_percent', 0),
-                'memory_percent': resources.get('memory_usage_percent', 0),
-                'disk_free_percent': resources.get('disk_free_percent', 0)
-            },
-            'resource_alerts': []
-        }
-
-        # Flag resource anomalies at time of event capture
-        cpu = resources.get('cpu_usage_percent', 0)
-        mem = resources.get('memory_usage_percent', 0)
-        disk = resources.get('disk_free_percent', 100)
-
-        if cpu > 90:
-            context['resource_alerts'].append(f'HIGH CPU: {cpu}%')
-        if mem > 90:
-            context['resource_alerts'].append(f'HIGH MEMORY: {mem}%')
-        if disk < 10:
-            context['resource_alerts'].append(f'LOW DISK: {disk}% free')
-
-        return context
+    return {
+        'resource_state': {
+            'cpu_percent':    cpu,
+            'memory_percent': mem,
+            'disk_free_percent': disk
+        },
+        'resource_alerts': alerts
+    }
 
 # ============================================================================
-# SYSTEM METADATA FUNCTIONS
+# SYSTEM METADATA
 # ============================================================================
 
 def get_system_id() -> str:
-    """Get unique system identifier. Uses hostname when system_id_mode is AUTO."""
     if _CONFIG["agent"].get("system_id_mode") == "AUTO":
         return socket.gethostname()
     try:
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Cryptography",
-            0,
-            winreg.KEY_READ
-        )
-        machine_guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0, winreg.KEY_READ)
+        guid, _ = winreg.QueryValueEx(key, "MachineGuid")
         winreg.CloseKey(key)
-        return machine_guid
+        return guid
     except Exception as e:
         print(f"Warning: Could not read MachineGuid: {e}", file=sys.stderr)
         return "UNKNOWN"
 
 
 def get_hostname() -> str:
-    """Get system hostname"""
     try:
         return socket.gethostname()
-    except Exception as e:
-        print(f"Warning: Could not get hostname: {e}", file=sys.stderr)
+    except Exception:
         return "UNKNOWN"
 
 
 def get_boot_session_id() -> str:
-    """Get current boot session identifier as UUID"""
     try:
-        boot_time = psutil.boot_time()
-        # Generate deterministic UUID from boot time and system ID
-        seed = f"{get_system_id()}-{boot_time}"
+        seed = f"{get_system_id()}-{psutil.boot_time()}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
-    except Exception as e:
-        print(f"Warning: Could not determine boot session: {e}", file=sys.stderr)
+    except Exception:
         return str(uuid.uuid4())
 
 
 def get_os_version() -> str:
-    """Get Windows OS version information"""
     try:
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
-            0,
-            winreg.KEY_READ
-        )
-        product_name, _ = winreg.QueryValueEx(key, "ProductName")
-        current_build, _ = winreg.QueryValueEx(key, "CurrentBuild")
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", 0, winreg.KEY_READ)
+        name, _  = winreg.QueryValueEx(key, "ProductName")
+        build, _ = winreg.QueryValueEx(key, "CurrentBuild")
         winreg.CloseKey(key)
-        return f"{product_name} (Build {current_build})"
-    except Exception as e:
-        print(f"Warning: Could not read OS version: {e}", file=sys.stderr)
+        return f"{name} (Build {build})"
+    except Exception:
         return "Windows (Unknown Version)"
 
 
 def get_uptime_seconds() -> int:
-    """Get system uptime in seconds"""
     try:
         return int(time.time() - psutil.boot_time())
-    except Exception as e:
-        print(f"Warning: Could not calculate uptime: {e}", file=sys.stderr)
+    except Exception:
         return 0
 
 # ============================================================================
 # RESOURCE MONITORING
 # ============================================================================
 
-def get_resource_snapshot() -> Dict[str, float]:
-    """Get current system resource usage"""
+def get_resource_snapshot() -> Dict:
+    """Single resource snapshot — call once per cycle, not per event."""
     try:
-        cpu_percent = psutil.cpu_percent(interval=0.1)
-        memory = psutil.virtual_memory()
+        mem  = psutil.virtual_memory()
         disk = psutil.disk_usage('/')
-        
         return {
-            "cpu_usage_percent": round(cpu_percent, 2),
-            "memory_usage_percent": round(memory.percent, 2),
-            "disk_free_percent": round(100.0 - disk.percent, 2)
+            'cpu_usage_percent':    round(psutil.cpu_percent(interval=0.1), 2),
+            'memory_usage_percent': round(mem.percent, 2),
+            'disk_free_percent':    round(100.0 - disk.percent, 2)
         }
-    except Exception as e:
-        print(f"Warning: Could not get resource snapshot: {e}", file=sys.stderr)
-        return {
-            "cpu_usage_percent": 0.0,
-            "memory_usage_percent": 0.0,
-            "disk_free_percent": 0.0
-        }
+    except Exception:
+        return {'cpu_usage_percent': 0.0, 'memory_usage_percent': 0.0, 'disk_free_percent': 0.0}
 
 # ============================================================================
-# EVENT PARSING AND FILTERING
+# EVENT PARSING
 # ============================================================================
 
 def extract_event_metadata(xml: str) -> Optional[Dict]:
-    """Extract metadata from event XML"""
     try:
-        metadata = {}
-        
-        # EventRecordID
-        match = re.search(r'EventRecordID["\']?>(\d+)<', xml)
-        metadata['event_record_id'] = int(match.group(1)) if match else None
-        
-        # Provider Name
-        match = re.search(r'Provider.*?Name=["\']([^"\']+)["\']', xml)
-        metadata['provider_name'] = match.group(1) if match else "Unknown"
-        
-        # Event ID
-        match = re.search(r'EventID["\']?>(\d+)<', xml)
-        metadata['event_id'] = int(match.group(1)) if match else 0
-        
-        # Level
-        match = re.search(r'Level["\']?>(\d+)<', xml)
-        metadata['level'] = int(match.group(1)) if match else 0
-        
-        # Task
-        match = re.search(r'Task["\']?>(\d+)<', xml)
-        metadata['task'] = int(match.group(1)) if match else 0
-        
-        # Opcode
-        match = re.search(r'Opcode["\']?>(\d+)<', xml)
-        metadata['opcode'] = int(match.group(1)) if match else 0
-        
-        # Keywords
-        match = re.search(r'Keywords["\']?>(0x[0-9a-fA-F]+)<', xml)
-        metadata['keywords'] = match.group(1) if match else "0x0"
-        
-        # Process ID
-        match = re.search(r'ProcessID["\']?>(\d+)<', xml)
-        metadata['process_id'] = int(match.group(1)) if match else 0
-        
-        # Thread ID
-        match = re.search(r'ThreadID["\']?>(\d+)<', xml)
-        metadata['thread_id'] = int(match.group(1)) if match else 0
-        
-        # TimeCreated SystemTime
-        match = re.search(r'SystemTime=["\']([^"\']+)["\']', xml)
-        metadata['event_time'] = match.group(1) if match else datetime.now(timezone.utc).isoformat()
-        
-        return metadata
+        def find(pattern, default=None):
+            m = re.search(pattern, xml)
+            return m.group(1) if m else default
+
+        record_id = find(r'EventRecordID["\']?>(\d+)<')
+        if not record_id:
+            return None
+
+        return {
+            'event_record_id': int(record_id),
+            'provider_name':   find(r'Provider.*?Name=["\']([^"\']+)["\']', 'Unknown'),
+            'event_id':        int(find(r'EventID["\']?>(\d+)<', '0')),
+            'level':           int(find(r'Level["\']?>(\d+)<', '0')),
+            'task':            int(find(r'Task["\']?>(\d+)<', '0')),
+            'opcode':          int(find(r'Opcode["\']?>(\d+)<', '0')),
+            'keywords':        find(r'Keywords["\']?>(0x[0-9a-fA-F]+)<', '0x0'),
+            'process_id':      int(find(r'ProcessID["\']?>(\d+)<', '0')),
+            'thread_id':       int(find(r'ThreadID["\']?>(\d+)<', '0')),
+            'event_time':      find(r'SystemTime=["\']([^"\']+)["\']', datetime.now(timezone.utc).isoformat()),
+        }
     except Exception as e:
         print(f"Warning: Could not parse event metadata: {e}", file=sys.stderr)
         return None
 
 
 def should_exclude_provider(provider_name: str) -> bool:
-    """Check if provider should be excluded based on keywords"""
-    provider_lower = provider_name.lower()
-    for keyword in EXCLUDE_PROVIDER_KEYWORDS:
-        if keyword in provider_lower:
-            return True
-    return False
+    p = provider_name.lower()
+    return any(kw in p for kw in EXCLUDE_PROVIDER_KEYWORDS)
 
 
 def generate_event_hash(raw_xml: str, system_id: str, event_record_id: int) -> str:
-    """Generate SHA256 hash for event integrity and deduplication"""
-    content = f"{raw_xml}{system_id}{event_record_id}"
-    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+    return hashlib.sha256(f"{raw_xml}{system_id}{event_record_id}".encode('utf-8')).hexdigest()
 
 # ============================================================================
 # CHECKPOINT MANAGER
 # ============================================================================
 
 class CheckpointManager:
-    """Manages per-channel checkpointing using EventRecordID"""
-    
-    def __init__(self, checkpoint_file: str):
-        self.checkpoint_file = checkpoint_file
+    def __init__(self, filepath: str):
+        self.filepath = filepath
         self.checkpoints: Dict[str, int] = {}
-        self.load()
-    
-    def load(self):
-        """Load checkpoints from file"""
-        if os.path.exists(self.checkpoint_file):
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.filepath):
             try:
-                with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
+                with open(self.filepath, 'r', encoding='utf-8') as f:
                     self.checkpoints = json.load(f)
                 print(f"Loaded checkpoints for {len(self.checkpoints)} channels")
             except Exception as e:
-                print(f"Warning: Could not load checkpoint file: {e}", file=sys.stderr)
-                self.checkpoints = {}
+                print(f"Warning: Could not load checkpoint: {e}", file=sys.stderr)
         else:
-            print("No existing checkpoint file, starting fresh")
-    
-    def get_last_record_id(self, channel: str) -> int:
-        """Get last processed EventRecordID for a channel"""
+            print("No checkpoint file found, starting fresh")
+
+    def get(self, channel: str) -> int:
         return self.checkpoints.get(channel, 0)
-    
-    def update_checkpoint(self, channel: str, record_id: int):
-        """Update checkpoint for a channel"""
+
+    def update(self, channel: str, record_id: int):
         self.checkpoints[channel] = record_id
-    
+
     def save(self):
-        """Atomically save checkpoints to file"""
+        """Atomic save via temp file + rename."""
+        tmp = f"{self.filepath}.tmp"
         try:
-            # Write to temporary file first
-            temp_file = f"{self.checkpoint_file}.tmp"
-            with open(temp_file, 'w', encoding='utf-8') as f:
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(self.checkpoints, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            
-            # Atomic rename
-            os.replace(temp_file, self.checkpoint_file)
+            os.replace(tmp, self.filepath)
         except Exception as e:
             print(f"Error saving checkpoint: {e}", file=sys.stderr)
 
 # ============================================================================
-# LOCAL FILE MANAGER (for testing mode)
+# LOCAL FILE MANAGER
 # ============================================================================
 
 class LocalFileManager:
-    """Handles local file output for testing without server"""
-    
     def __init__(self, output_file: str):
         self.output_file = output_file
         self.event_count = 0
-        self.file_number = 1
-        self._load_or_create_file()
-    
-    def _load_or_create_file(self):
-        """Load existing file or create new one"""
+        self._init_file()
+
+    def _init_file(self):
         if os.path.exists(self.output_file):
             try:
                 with open(self.output_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.event_count = len(data.get('events', []))
-                print(f"Loaded existing output file: {self.event_count} events")
-            except Exception as e:
-                print(f"Warning: Could not load existing file: {e}")
-                self.event_count = 0
-        else:
-            # Create new file with structure
-            self._create_new_file()
-    
-    def _create_new_file(self):
-        """Create new JSON file with initial structure"""
-        initial_data = {
-            "collector_info": {
-                "version": COLLECTOR_VERSION,
-                "mode": "local_testing",
-                "created": datetime.now(timezone.utc).isoformat()
-            },
-            "events": []
+                    self.event_count = len(json.load(f).get('events', []))
+                print(f"Loaded existing output: {self.event_count} events")
+                return
+            except Exception:
+                pass
+        self._create_file()
+
+    def _create_file(self):
+        data = {
+            'collector_info': {'version': COLLECTOR_VERSION, 'created': datetime.now(timezone.utc).isoformat()},
+            'events': []
         }
         with open(self.output_file, 'w', encoding='utf-8') as f:
-            json.dump(initial_data, f, indent=2 if PRETTY_PRINT_JSON else None)
+            json.dump(data, f, indent=2)
         self.event_count = 0
-        print(f"Created new output file: {self.output_file}")
-    
-    def _rotate_file_if_needed(self):
-        """Rotate file if event limit reached"""
+
+    def _rotate_if_needed(self):
         if self.event_count >= MAX_EVENTS_PER_FILE:
-            # Rename current file
-            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-            archived_name = f"collected_events_{timestamp}.json"
-            os.rename(self.output_file, archived_name)
-            print(f"  → Rotated to {archived_name} ({self.event_count} events)")
-            
-            # Create new file
-            self._create_new_file()
-            self.file_number += 1
-    
+            ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+            archived = self.output_file.replace('.json', f'_{ts}.json')
+            os.rename(self.output_file, archived)
+            print(f"  → Rotated to {archived}")
+            self._create_file()
+
     def save_batch(self, payload: Dict) -> bool:
-        """Save event batch to local file. Returns True if successful."""
         try:
-            # Check if rotation needed
-            self._rotate_file_if_needed()
-            
-            # Read current file
+            self._rotate_if_needed()
             with open(self.output_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
-            # Update metadata
+
             data['last_updated'] = payload.get('timestamp_collected')
-            data['system_info'] = {
-                'system_id': payload.get('system_id'),
-                'hostname': payload.get('hostname'),
-                'boot_session_id': payload.get('boot_session_id'),
-                'os_version': payload.get('os_version'),
-                'uptime_seconds': payload.get('uptime_seconds')
-            }
-            
-            # Add new events
+            data['system_info'] = {k: payload.get(k) for k in ('system_id', 'hostname', 'boot_session_id', 'os_version', 'uptime_seconds')}
+
             new_events = payload.get('events', [])
             data['events'].extend(new_events)
             self.event_count += len(new_events)
-            
-            # Write back to file
+
             with open(self.output_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2 if PRETTY_PRINT_JSON else None, ensure_ascii=False)
-            
+                json.dump(data, f, indent=2, ensure_ascii=False)
             return True
-            
         except Exception as e:
-            print(f"  ✗ Error saving to local file: {e}", file=sys.stderr)
+            print(f"  ✗ Error saving locally: {e}", file=sys.stderr)
             return False
 
 # ============================================================================
-# KAFKA MANAGER (for pipeline mode)
+# KAFKA MANAGER
 # ============================================================================
 
-# Read Kafka tuning from config.json (with safe defaults)
-KAFKA_ACKS = _CONFIG["kafka"].get("acks", "all")
-KAFKA_RETRIES = int(_CONFIG["kafka"].get("retries", 5))
-KAFKA_RETRY_BACKOFF_MS = int(_CONFIG["kafka"].get("retry_backoff_ms", 3000))
-KAFKA_LINGER_MS = int(_CONFIG["kafka"].get("linger_ms", 50))
-KAFKA_REQUEST_TIMEOUT_MS = int(_CONFIG["kafka"].get("request_timeout_ms", 15000))
-
-
 class KafkaManager:
-    """Handles Kafka event publishing with delivery confirmation and auto-reconnect."""
-
     def __init__(self, bootstrap_servers: str, topic: str):
         if not HAS_KAFKA:
-            print("ERROR: kafka-python-ng is required for Kafka mode.", file=sys.stderr)
-            print("  Install with: pip install kafka-python-ng", file=sys.stderr)
+            print("ERROR: kafka-python-ng required. pip install kafka-python-ng", file=sys.stderr)
             sys.exit(1)
-
         self.topic = topic
         self.bootstrap_servers = bootstrap_servers
         self.producer = None
         self._reconnect_attempt = 0
         self._connect()
 
+    def _make_producer(self):
+        return KafkaProducer(
+            bootstrap_servers=self.bootstrap_servers,
+            client_id=KAFKA_CLIENT_ID,
+            value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
+            key_serializer=lambda k: k.encode('utf-8') if k else None,
+            acks=KAFKA_ACKS,
+            retries=KAFKA_RETRIES,
+            retry_backoff_ms=KAFKA_RETRY_BACKOFF_MS,
+            linger_ms=KAFKA_LINGER_MS,
+            request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
+            max_block_ms=KAFKA_REQUEST_TIMEOUT_MS,
+            batch_size=32768
+        )
+
     def _connect(self):
-        """Connect to Kafka broker with retry. Sets self.producer=None on failure."""
         for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
-                self.producer = KafkaProducer(
-                    bootstrap_servers=self.bootstrap_servers,
-                    client_id=KAFKA_CLIENT_ID,
-                    value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
-                    key_serializer=lambda k: k.encode('utf-8') if k else None,
-                    acks=KAFKA_ACKS,
-                    retries=KAFKA_RETRIES,
-                    retry_backoff_ms=KAFKA_RETRY_BACKOFF_MS,
-                    linger_ms=KAFKA_LINGER_MS,
-                    request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
-                    max_block_ms=KAFKA_REQUEST_TIMEOUT_MS,
-                    batch_size=32768
-                )
-                logger.info(f"Connected to Kafka at {self.bootstrap_servers} "
-                            f"(acks={KAFKA_ACKS}, retries={KAFKA_RETRIES}, "
-                            f"linger_ms={KAFKA_LINGER_MS})")
+                self.producer = self._make_producer()
+                logger.info(f"Connected to Kafka at {self.bootstrap_servers}")
                 self._reconnect_attempt = 0
                 return
             except Exception as e:
-                logger.error(f"Kafka connection failed (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS}): {e}")
+                logger.error(f"Kafka connect failed ({attempt + 1}/{MAX_RETRY_ATTEMPTS}): {e}")
                 if attempt < MAX_RETRY_ATTEMPTS - 1:
-                    backoff = RETRY_BACKOFF_BASE * (2 ** attempt)
-                    logger.info(f"  Retrying in {backoff:.0f}s...")
-                    time.sleep(backoff)
-        logger.critical("Could not connect to Kafka broker after all retries. "
-                        "Will attempt lazy reconnection on next send.")
+                    time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+        logger.critical("Could not connect to Kafka. Will retry lazily on next send.")
         self.producer = None
 
     def _ensure_connected(self) -> bool:
-        """Lazy reconnection: attempt to reconnect if producer is None.
-        Uses exponential backoff across calls to avoid hammering the broker."""
-        if self.producer is not None:
+        if self.producer:
             return True
-
         self._reconnect_attempt += 1
         backoff = min(RETRY_BACKOFF_BASE * (2 ** self._reconnect_attempt), 60)
-        logger.info(f"Kafka reconnection attempt {self._reconnect_attempt} "
-                    f"(backoff {backoff:.0f}s)...")
+        logger.info(f"Kafka reconnect attempt {self._reconnect_attempt} (backoff {backoff:.0f}s)...")
         time.sleep(backoff)
-
         try:
-            self.producer = KafkaProducer(
-                bootstrap_servers=self.bootstrap_servers,
-                client_id=KAFKA_CLIENT_ID,
-                value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
-                key_serializer=lambda k: k.encode('utf-8') if k else None,
-                acks=KAFKA_ACKS,
-                retries=KAFKA_RETRIES,
-                retry_backoff_ms=KAFKA_RETRY_BACKOFF_MS,
-                linger_ms=KAFKA_LINGER_MS,
-                request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
-                max_block_ms=KAFKA_REQUEST_TIMEOUT_MS,
-                batch_size=32768
-            )
+            self.producer = self._make_producer()
             logger.info(f"Reconnected to Kafka at {self.bootstrap_servers}")
             self._reconnect_attempt = 0
             return True
         except Exception as e:
-            logger.error(f"Kafka reconnection failed: {e}")
+            logger.error(f"Kafka reconnect failed: {e}")
             self.producer = None
             return False
 
     def send_batch(self, payload: Dict) -> Dict:
-        """Publish event batch to Kafka with per-message delivery confirmation.
-
-        Returns dict: {'sent': N, 'failed': M, 'success': bool}
-        """
         result = {'sent': 0, 'failed': 0, 'success': False}
-
         if not self._ensure_connected():
             result['failed'] = len(payload.get('events', []))
             return result
 
+        system_id = payload.get('system_id', 'unknown')
+        for event in payload.get('events', []):
+            msg = {
+                'system_id':           system_id,
+                'hostname':            payload.get('hostname'),
+                'collector_version':   payload.get('collector_version'),
+                'timestamp_collected': payload.get('timestamp_collected'),
+                'event':               event
+            }
+            try:
+                self.producer.send(self.topic, key=system_id, value=msg).get(timeout=10)
+                result['sent'] += 1
+            except (KafkaError, Exception) as e:
+                result['failed'] += 1
+                logger.error(f"Delivery failed for {event.get('event_hash', '?')[:12]}: {e}")
+
         try:
-            system_id = payload.get('system_id', 'unknown')
-            events = payload.get('events', [])
-
-            for event in events:
-                kafka_message = {
-                    'system_id': system_id,
-                    'hostname': payload.get('hostname'),
-                    'collector_version': payload.get('collector_version'),
-                    'timestamp_collected': payload.get('timestamp_collected'),
-                    'event': event
-                }
-                try:
-                    future = self.producer.send(
-                        self.topic,
-                        key=system_id,
-                        value=kafka_message
-                    )
-                    # Block until this message is confirmed by broker
-                    future.get(timeout=10)
-                    result['sent'] += 1
-                except KafkaError as e:
-                    result['failed'] += 1
-                    logger.error(f"Delivery failed for event "
-                                 f"{event.get('event_hash', '?')[:12]}: {e}")
-                except Exception as e:
-                    result['failed'] += 1
-                    logger.error(f"Unexpected delivery error for event "
-                                 f"{event.get('event_hash', '?')[:12]}: {e}")
-
-            # Flush any remaining buffered messages
             self.producer.flush(timeout=30)
+        except Exception:
+            pass
 
-            result['success'] = result['failed'] == 0
-            return result
-
-        except KafkaError as e:
-            logger.error(f"Kafka batch send failed: {e}")
-            self.producer = None  # Mark for reconnection
-            result['failed'] = len(payload.get('events', [])) - result['sent']
-            return result
-        except Exception as e:
-            logger.error(f"Unexpected Kafka error during batch send: {e}")
-            self.producer = None
-            result['failed'] = len(payload.get('events', [])) - result['sent']
-            return result
+        result['success'] = result['failed'] == 0
+        return result
 
     def close(self):
-        """Flush and close the Kafka producer"""
         if self.producer:
             try:
                 self.producer.flush(timeout=10)
                 self.producer.close(timeout=10)
-                logger.info("Kafka producer closed gracefully")
+                logger.info("Kafka producer closed")
             except Exception as e:
                 logger.error(f"Error closing Kafka producer: {e}")
 
 # ============================================================================
-# TRANSMISSION MANAGER
+# TRANSMISSION MANAGER (HTTPS fallback)
 # ============================================================================
 
 class TransmissionManager:
-    """Handles HTTPS transmission with retry logic and fallback"""
-    
     def __init__(self, endpoint: str, auth_token: Optional[str] = None):
         self.endpoint = endpoint
-        self.auth_token = auth_token
         self.session = requests.Session()
-        
-        # Set headers
         self.session.headers.update({
             'Content-Type': 'application/json',
             'User-Agent': f'SentinelCore/{COLLECTOR_VERSION}'
         })
-        
-        if self.auth_token:
-            self.session.headers['Authorization'] = f'Bearer {self.auth_token}'
-    
+        if auth_token:
+            self.session.headers['Authorization'] = f'Bearer {auth_token}'
+
     def send_batch(self, payload: Dict) -> bool:
-        """Send event batch with retry logic. Returns True if successful."""
         for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
-                response = self.session.post(
-                    self.endpoint,
-                    json=payload,
-                    timeout=REQUEST_TIMEOUT
-                )
-                
-                if response.status_code in [200, 201, 202]:
-                    if attempt > 0:
-                        print(f"  ✓ Transmission successful on retry {attempt + 1}")
+                r = self.session.post(self.endpoint, json=payload, timeout=REQUEST_TIMEOUT)
+                if r.status_code in [200, 201, 202]:
                     return True
-                else:
-                    print(f"  ✗ Server returned {response.status_code}: {response.text[:100]}", file=sys.stderr)
-                    
+                print(f"  ✗ Server returned {r.status_code}: {r.text[:100]}", file=sys.stderr)
             except requests.exceptions.RequestException as e:
-                print(f"  ✗ Transmission failed (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS}): {e}", file=sys.stderr)
-            
-            # Exponential backoff before retry
+                print(f"  ✗ Transmission failed ({attempt + 1}/{MAX_RETRY_ATTEMPTS}): {e}", file=sys.stderr)
             if attempt < MAX_RETRY_ATTEMPTS - 1:
-                sleep_time = RETRY_BACKOFF_BASE * (2 ** attempt)
-                time.sleep(sleep_time)
-        
+                time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
         return False
-    
+
     def save_to_fallback(self, payload: Dict):
-        """Save failed transmission to local fallback file"""
         if not ENABLE_LOCAL_FALLBACK:
             return
-        
         try:
-            fallback_file = f"{FALLBACK_FILE_PREFIX}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
-            with open(fallback_file, 'w', encoding='utf-8') as f:
+            path = f"{FALLBACK_FILE_PREFIX}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+            with open(path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
-            print(f"  ⚠ Saved to fallback file: {fallback_file}")
+            print(f"  ⚠ Saved to fallback: {path}")
         except Exception as e:
-            print(f"  ✗ Could not save to fallback: {e}", file=sys.stderr)
+            print(f"  ✗ Could not save fallback: {e}", file=sys.stderr)
+
+# ============================================================================
+# OUTPUT STRATEGY (replaces inline if/elif/else branching)
+# ============================================================================
+
+class OutputStrategy(ABC):
+    @abstractmethod
+    def send(self, payload: Dict) -> bool:
+        """Send payload. Returns True on full success."""
+
+    def close(self):
+        pass
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        pass
+
+
+class KafkaOutputStrategy(OutputStrategy):
+    def __init__(self):
+        self._mgr = KafkaManager(KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC)
+
+    def send(self, payload: Dict) -> bool:
+        result = self._mgr.send_batch(payload)
+        n, f = result['sent'], result['failed']
+        if result['success']:
+            logger.info(f"  ✓ Published {n} events to Kafka topic '{KAFKA_TOPIC}'")
+        elif n > 0:
+            logger.warning(f"  ⚠ Partial publish: {n} sent, {f} failed — checkpoint NOT advanced")
+        else:
+            logger.error(f"  ✗ Kafka send failed — checkpoint NOT advanced")
+        return result['success']
+
+    def close(self):
+        self._mgr.close()
+
+    @property
+    def name(self) -> str:
+        return f"KAFKA  →  {KAFKA_BOOTSTRAP_SERVERS} / {KAFKA_TOPIC}"
+
+
+class LocalFileOutputStrategy(OutputStrategy):
+    def __init__(self):
+        self._mgr = LocalFileManager(LOCAL_OUTPUT_FILE)
+
+    def send(self, payload: Dict) -> bool:
+        ok = self._mgr.save_batch(payload)
+        n = len(payload.get('events', []))
+        if ok:
+            print(f"  ✓ Saved {n} events to {LOCAL_OUTPUT_FILE}")
+        else:
+            print(f"  ✗ Failed to save events locally")
+        return ok
+
+    @property
+    def name(self) -> str:
+        return f"LOCAL FILE  →  {LOCAL_OUTPUT_FILE}"
+
+
+class HttpsOutputStrategy(OutputStrategy):
+    def __init__(self):
+        self._mgr = TransmissionManager(SERVER_ENDPOINT, AUTH_TOKEN)
+
+    def send(self, payload: Dict) -> bool:
+        ok = self._mgr.send_batch(payload)
+        if not ok:
+            self._mgr.save_to_fallback(payload)
+        return ok
+
+    @property
+    def name(self) -> str:
+        return f"HTTPS  →  {SERVER_ENDPOINT}"
+
+
+def resolve_output_strategy() -> OutputStrategy:
+    """Single point of strategy resolution — called once at startup."""
+    if KAFKA_MODE:
+        return KafkaOutputStrategy()
+    if LOCAL_TESTING_MODE:
+        return LocalFileOutputStrategy()
+    return HttpsOutputStrategy()
 
 # ============================================================================
 # EVENT COLLECTION
 # ============================================================================
 
 def collect_events_from_channel(channel: str, last_record_id: int) -> List[Dict]:
-    """
-    Collect events from a channel with multi-level filtering
-    Returns list of events with metadata and raw XML
-    """
     events = []
-    
+    level_filter = " or ".join(f"Level={l}" for l in INCLUDE_LEVELS)
+    query = f"""
+    <QueryList>
+        <Query>
+            <Select Path="{channel}">
+                *[System[({level_filter}) and EventRecordID &gt; {last_record_id}]]
+            </Select>
+        </Query>
+    </QueryList>"""
+
     try:
-        # Build XPath query for incremental collection with level filtering
-        level_filter = " or ".join([f"Level={level}" for level in INCLUDE_LEVELS])
-        query = f"""
-        <QueryList>
-            <Query>
-                <Select Path="{channel}">
-                    *[System[({level_filter}) and EventRecordID &gt; {last_record_id}]]
-                </Select>
-            </Query>
-        </QueryList>
-        """
-        
-        # Open query handle
-        query_handle = win32evtlog.EvtQuery(
+        handle = win32evtlog.EvtQuery(
             channel,
             win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryForwardDirection,
-            query,
-            None
+            query, None
         )
-        
-        # Fetch events in batches
         while True:
             try:
-                event_batch = win32evtlog.EvtNext(query_handle, BATCH_SIZE, 0)
-                if not event_batch:
+                batch = win32evtlog.EvtNext(handle, BATCH_SIZE, 0)
+                if not batch:
                     break
-                
-                for event in event_batch:
+                for event in batch:
                     try:
-                        # Render event as XML
                         xml = win32evtlog.EvtRender(event, win32evtlog.EvtRenderEventXml)
-                        
                         if not xml:
-                            continue  # Skip if render failed
-                        
-                        # Extract metadata
-                        metadata = extract_event_metadata(xml)
-                        if not metadata or not metadata['event_record_id']:
                             continue
-                        
-                        # Filter by provider name
-                        if should_exclude_provider(metadata['provider_name']):
+                        meta = extract_event_metadata(xml)
+                        if not meta:
                             continue
-                        
-                        # Add to results
-                        events.append({
-                            'metadata': metadata,
-                            'raw_xml': xml,
-                            'log_channel': channel
-                        })
-                        
-                    except Exception as e:
-                        # Skip individual event errors
+                        if should_exclude_provider(meta['provider_name']):
+                            continue
+                        events.append({'metadata': meta, 'raw_xml': xml, 'log_channel': channel})
+                    except Exception:
                         continue
-                
             except pywintypes.error as e:
                 if e.winerror == 259:  # ERROR_NO_MORE_ITEMS
                     break
-                else:
-                    raise
-    
+                raise
     except pywintypes.error as e:
-        error_code = e.winerror
-        
-        # Handle expected errors gracefully
-        if error_code in [15007, 5, 15001, 1734]:  # Access denied, not found, etc.
-            pass  # Silently skip in production
-        else:
-            print(f"Error querying channel {channel}: {e}", file=sys.stderr)
-    
+        if e.winerror not in [5, 15001, 15007, 1734]:
+            print(f"Error querying {channel}: {e}", file=sys.stderr)
     except Exception as e:
-        # Log unexpected errors but don't crash
-        print(f"Unexpected error in channel {channel}: {e}", file=sys.stderr)
-    
+        print(f"Unexpected error in {channel}: {e}", file=sys.stderr)
+
     return events
 
 # ============================================================================
@@ -1011,250 +806,138 @@ def collect_events_from_channel(channel: str, last_record_id: int) -> List[Dict]
 # ============================================================================
 
 def run_collector():
-    """Main collection loop"""
-    print(f"SentinelCore v{COLLECTOR_VERSION} - Production Telemetry Agent")
+    print(f"SentinelCore v{COLLECTOR_VERSION}")
     print("=" * 70)
-    print(f"Working Dir:    {SCRIPT_DIR}")
-    print(f"PID:            {os.getpid()}")
+    print(f"PID:  {os.getpid()}   Dir: {SCRIPT_DIR}")
 
-    # Acquire PID lock (prevent duplicate instances)
     if not acquire_pid_lock():
         sys.exit(1)
 
-    # Check administrator privileges
-    admin_status, admin_warnings = check_admin_privileges()
-    privilege_level = "ADMINISTRATOR" if admin_status else "STANDARD USER"
-    print(f"Privileges:     {privilege_level}")
+    admin, warnings = check_admin_privileges()
+    print(f"Privileges: {'ADMINISTRATOR' if admin else 'STANDARD USER'}")
+    for w in warnings:
+        print(f"  ⚠ {w}")
 
-    if admin_warnings:
-        print("")
-        for w in admin_warnings:
-            print(f"  ⚠ {w}")
-        print("")
-    
-    # Initialize system metadata
-    system_id = get_system_id()
-    hostname = get_hostname()
-    boot_session_id = get_boot_session_id()
-    os_version = get_os_version()
-    
-    print(f"System ID:      {system_id}")
-    print(f"Hostname:       {hostname}")
-    print(f"Boot Session:   {boot_session_id}")
-    print(f"OS Version:     {os_version}")
-    print(f"Uptime:         {get_uptime_seconds()}s")
+    system_id      = get_system_id()
+    hostname       = get_hostname()
+    boot_session   = get_boot_session_id()
+    os_version     = get_os_version()
+
+    print(f"\nSystem:   {system_id}  ({hostname})")
+    print(f"OS:       {os_version}")
+    print(f"Uptime:   {get_uptime_seconds()}s")
     print("=" * 70)
-    
-    # Initialize managers
+
+    strategy       = resolve_output_strategy()
     checkpoint_mgr = CheckpointManager(CHECKPOINT_FILE)
-    kafka_mgr = None
-    file_mgr = None
-    transmission_mgr = None
-
-    if KAFKA_MODE:
-        # Use Kafka pipeline
-        kafka_mgr = KafkaManager(KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC)
-    elif LOCAL_TESTING_MODE:
-        # Use local file output for testing
-        file_mgr = LocalFileManager(LOCAL_OUTPUT_FILE)
-    else:
-        # Use HTTPS transmission for production
-        transmission_mgr = TransmissionManager(SERVER_ENDPOINT, AUTH_TOKEN)
-    
-    # Duplicate detection
     seen_hashes: deque = deque(maxlen=DUPLICATE_HASH_WINDOW)
-    
-    # Determine mode name
-    if KAFKA_MODE:
-        mode_name = 'KAFKA PIPELINE'
-    elif LOCAL_TESTING_MODE:
-        mode_name = 'LOCAL TESTING'
-    else:
-        mode_name = 'PRODUCTION'
 
-    # Display configuration
-    print(f"\nMode:           {mode_name}")
-    print(f"Target Logs:    {', '.join(TARGET_LOGS)}")
-    
-    if KAFKA_MODE:
-        print(f"Kafka Broker:   {KAFKA_BOOTSTRAP_SERVERS}")
-        print(f"Kafka Topic:    {KAFKA_TOPIC}")
-    elif LOCAL_TESTING_MODE:
-        print(f"Output File:    {LOCAL_OUTPUT_FILE}")
-        print(f"Max Events:     {MAX_EVENTS_PER_FILE} per file")
-        print(f"Format:         {'Pretty JSON' if PRETTY_PRINT_JSON else 'Compact JSON'}")
-    else:
-        print(f"Server:         {SERVER_ENDPOINT}")
-        print(f"Auth:           {'Enabled' if AUTH_TOKEN else 'Disabled'}")
-        print(f"Fallback:       {'Enabled' if ENABLE_LOCAL_FALLBACK else 'Disabled'}")
-    
-    print(f"Interval:       {COLLECTION_INTERVAL_SECONDS}s")
+    print(f"\nOutput:   {strategy.name}")
+    print(f"Logs:     {', '.join(TARGET_LOGS)}")
+    print(f"Interval: {COLLECTION_INTERVAL_SECONDS}s")
     print("=" * 70)
-    print("\nStarting collection loop... (Press Ctrl+C to stop)\n")
-    
+    print("\nStarting collection... (Ctrl+C to stop)\n")
+
     cycle_count = 0
-    
+
     try:
         while True:
             cycle_count += 1
             cycle_start = time.time()
-            batch_events = []
-            
             print(f"[Cycle {cycle_count}] {datetime.now(timezone.utc).isoformat()}")
 
-            # Disk space guard
             if not check_disk_space():
-                print(f"  Skipping cycle (low disk space). Retrying in {COLLECTION_INTERVAL_SECONDS}s...")
                 time.sleep(COLLECTION_INTERVAL_SECONDS)
                 continue
-            
-            # Collect from target channels
-            for channel in TARGET_LOGS:
-                last_record_id = checkpoint_mgr.get_last_record_id(channel)
-                events = collect_events_from_channel(channel, last_record_id)
-                
-                if events:
-                    print(f"  {channel}: {len(events)} new events")
-                    
-                    for event in events:
-                        # Generate event hash
-                        event_hash = generate_event_hash(
-                            event['raw_xml'],
-                            system_id,
-                            event['metadata']['event_record_id']
-                        )
-                        
-                        # Skip duplicates
-                        if event_hash in seen_hashes:
-                            continue
-                        
-                        seen_hashes.append(event_hash)
-                        
-                        # Get resource snapshot
-                        resources = get_resource_snapshot()
-                        
-                        # Classify for fault diagnosis
-                        fault_info = ErrorClassifier.classify(
-                            event['metadata']['provider_name'],
-                            event['metadata']['event_id'],
-                            event['metadata']['level']
-                        )
-                        diag_context = ErrorClassifier.get_diagnostic_context(
-                            event['metadata'], resources
-                        )
 
-                        # Build event payload with required structured fields
-                        severity_map = {1: 'CRITICAL', 2: 'ERROR', 3: 'WARNING', 4: 'INFO', 5: 'VERBOSE'}
-                        event_level = event['metadata']['level']
-                        event_payload = {
-                            'log_channel': event['log_channel'],
-                            'event_record_id': event['metadata']['event_record_id'],
-                            'provider_name': event['metadata']['provider_name'],
-                            'event_id': event['metadata']['event_id'],
-                            'level': event_level,
-                            'task': event['metadata']['task'],
-                            'opcode': event['metadata']['opcode'],
-                            'keywords': event['metadata']['keywords'],
-                            'process_id': event['metadata']['process_id'],
-                            'thread_id': event['metadata']['thread_id'],
-                            'event_time': event['metadata']['event_time'],
-                            'cpu_usage_percent': resources['cpu_usage_percent'],
-                            'memory_usage_percent': resources['memory_usage_percent'],
-                            'disk_free_percent': resources['disk_free_percent'],
-                            'event_hash': event_hash,
-                            'fault_type': fault_info['fault_type'],
-                            'fault_description': fault_info['fault_description'],
-                            'severity': severity_map.get(event_level, fault_info['severity']),
-                            'message': f"{event['metadata']['provider_name']} Event {event['metadata']['event_id']} "
-                                       f"({severity_map.get(event_level, 'UNKNOWN')}) on channel {event['log_channel']}",
-                            'created_at': datetime.now(timezone.utc).isoformat(),
-                            'diagnostic_context': diag_context,
-                            'raw_xml': event['raw_xml']
-                        }
-                        
-                        batch_events.append(event_payload)
-                    
-                    # Update checkpoint with highest record ID
-                    max_record_id = max(e['metadata']['event_record_id'] for e in events)
-                    
-                    # Transmit batch if we have events
-                    if batch_events:
-                        # Build transmission payload
-                        payload = {
-                            'system_id': system_id,
-                            'hostname': hostname,
-                            'boot_session_id': boot_session_id,
-                            'os_version': os_version,
-                            'uptime_seconds': get_uptime_seconds(),
-                            'collector_version': COLLECTOR_VERSION,
-                            'timestamp_collected': datetime.now(timezone.utc).isoformat(),
-                            'events': batch_events
-                        }
-                        
-                        # Save batch (Kafka, local file, or HTTPS depending on mode)
-                        if KAFKA_MODE:
-                            # Kafka pipeline mode with delivery confirmation
-                            send_result = kafka_mgr.send_batch(payload)
-                            if send_result['success']:
-                                logger.info(f"  ✓ Published {send_result['sent']} events "
-                                            f"to Kafka topic '{KAFKA_TOPIC}'")
-                                checkpoint_mgr.update_checkpoint(channel, max_record_id)
-                                checkpoint_mgr.save()
-                            elif send_result['sent'] > 0:
-                                logger.warning(f"  ⚠ Partial publish: {send_result['sent']} sent, "
-                                               f"{send_result['failed']} failed")
-                                logger.warning(f"  ⚠ Checkpoint NOT advanced for {channel} "
-                                               f"due to partial Kafka failure")
-                            else:
-                                logger.error(f"  ✗ Failed to publish any events to Kafka")
-                                logger.error(f"  ⚠ Checkpoint NOT advanced for {channel} "
-                                             f"due to Kafka failure")
-                        elif LOCAL_TESTING_MODE:
-                            # Local testing mode - write to file
-                            if file_mgr.save_batch(payload):
-                                print(f"  ✓ Saved {len(batch_events)} events to {LOCAL_OUTPUT_FILE}")
-                                # Always advance checkpoint in testing mode
-                                checkpoint_mgr.update_checkpoint(channel, max_record_id)
-                                checkpoint_mgr.save()
-                            else:
-                                print(f"  ✗ Failed to save events locally")
-                        else:
-                            # Production mode - HTTPS transmission
-                            if transmission_mgr.send_batch(payload):
-                                # Only advance checkpoint on successful transmission
-                                checkpoint_mgr.update_checkpoint(channel, max_record_id)
-                                checkpoint_mgr.save()
-                            else:
-                                # Save to fallback if transmission failed
-                                transmission_mgr.save_to_fallback(payload)
-                                print(f"  ⚠ Checkpoint NOT advanced for {channel} due to transmission failure")
-                        
-                        batch_events = []  # Clear for next channel
-            
-            cycle_duration = time.time() - cycle_start
-            print(f"Cycle complete in {cycle_duration:.2f}s\n")
-            
-            # Sleep until next cycle
-            sleep_time = max(0, COLLECTION_INTERVAL_SECONDS - cycle_duration)
-            if sleep_time > 0:
+            # ── Resource snapshot once per cycle (NOT per event) ──────────
+            resources = get_resource_snapshot()
+
+            pending_checkpoints: Dict[str, int] = {}
+
+            for channel in TARGET_LOGS:
+                raw_events = collect_events_from_channel(channel, checkpoint_mgr.get(channel))
+                if not raw_events:
+                    continue
+
+                print(f"  {channel}: {len(raw_events)} new event(s)")
+                batch_events = []
+
+                for ev in raw_events:
+                    h = generate_event_hash(ev['raw_xml'], system_id, ev['metadata']['event_record_id'])
+                    if h in seen_hashes:
+                        continue
+                    seen_hashes.append(h)
+
+                    fault      = classify_event(ev['metadata']['provider_name'], ev['metadata']['event_id'], ev['metadata']['level'])
+                    diag       = build_diagnostic_context(resources)
+                    level      = ev['metadata']['level']
+
+                    batch_events.append({
+                        'log_channel':          ev['log_channel'],
+                        'event_record_id':      ev['metadata']['event_record_id'],
+                        'provider_name':        ev['metadata']['provider_name'],
+                        'event_id':             ev['metadata']['event_id'],
+                        'level':                level,
+                        'task':                 ev['metadata']['task'],
+                        'opcode':               ev['metadata']['opcode'],
+                        'keywords':             ev['metadata']['keywords'],
+                        'process_id':           ev['metadata']['process_id'],
+                        'thread_id':            ev['metadata']['thread_id'],
+                        'event_time':           ev['metadata']['event_time'],
+                        'cpu_usage_percent':    resources['cpu_usage_percent'],
+                        'memory_usage_percent': resources['memory_usage_percent'],
+                        'disk_free_percent':    resources['disk_free_percent'],
+                        'event_hash':           h,
+                        'fault_type':           fault['fault_type'],
+                        'fault_description':    fault['fault_description'],
+                        'severity':             fault['severity'],
+                        'message':              f"{ev['metadata']['provider_name']} Event {ev['metadata']['event_id']} ({fault['severity']}) on {ev['log_channel']}",
+                        'created_at':           datetime.now(timezone.utc).isoformat(),
+                        'diagnostic_context':   diag,
+                        'raw_xml':              ev['raw_xml']
+                    })
+
+                if not batch_events:
+                    continue
+
+                payload = {
+                    'system_id':           system_id,
+                    'hostname':            hostname,
+                    'boot_session_id':     boot_session,
+                    'os_version':          os_version,
+                    'uptime_seconds':      get_uptime_seconds(),
+                    'collector_version':   COLLECTOR_VERSION,
+                    'timestamp_collected': datetime.now(timezone.utc).isoformat(),
+                    'events':              batch_events
+                }
+
+                if strategy.send(payload):
+                    pending_checkpoints[channel] = max(e['metadata']['event_record_id'] for e in raw_events)
+
+            # ── Save checkpoint once per cycle (NOT per channel) ──────────
+            if pending_checkpoints:
+                for ch, rid in pending_checkpoints.items():
+                    checkpoint_mgr.update(ch, rid)
+                checkpoint_mgr.save()
+
+            print(f"Cycle done in {time.time() - cycle_start:.2f}s\n")
+            sleep_time = max(0, COLLECTION_INTERVAL_SECONDS - (time.time() - cycle_start))
+            if sleep_time:
                 time.sleep(sleep_time)
-    
+
     except KeyboardInterrupt:
-        print("\n\nGraceful shutdown initiated...")
+        print("\nShutting down gracefully...")
         checkpoint_mgr.save()
-        if kafka_mgr:
-            kafka_mgr.close()
+        strategy.close()
         release_pid_lock()
-        print("Checkpoints saved")
-        print(f"Total cycles completed: {cycle_count}")
-        print("Shutdown complete")
+        print(f"Checkpoints saved. Cycles completed: {cycle_count}")
         sys.exit(0)
-    
+
     except Exception as e:
         print(f"\nFatal error: {e}", file=sys.stderr)
         checkpoint_mgr.save()
-        if kafka_mgr:
-            kafka_mgr.close()
+        strategy.close()
         release_pid_lock()
         sys.exit(1)
 

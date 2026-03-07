@@ -260,7 +260,7 @@ class TestErrorDetection(unittest.TestCase):
 
     def test_detect_critical_errors(self):
         """Should detect critical power events (Kernel-Power 41)."""
-        from analyze_logs import detect_errors
+        from analyzer import detect_errors
         events = [
             build_test_event('Microsoft-Windows-Kernel-Power', 41, 1, 1001,
                            SAMPLE_XML_CRITICAL, 'SYSTEM_FAULT'),
@@ -269,15 +269,15 @@ class TestErrorDetection(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]['level'], 1)
         self.assertEqual(errors[0]['level_name'], 'CRITICAL')
-        self.assertTrue(errors[0]['known_pattern'])
+        self.assertTrue(errors[0]['known'])
         self.assertIn('Unexpected Shutdown', errors[0]['title'])
         self.assertTrue(len(errors[0]['causes']) > 0)
-        self.assertTrue(len(errors[0]['actions']) > 0)
+        self.assertTrue(len(errors[0]['solutions']) > 0)
         print(f"  Detected: {errors[0]['title']}")
 
     def test_detect_service_crash(self):
         """Should detect service crash events (SCM 7031)."""
-        from analyze_logs import detect_errors
+        from analyzer import detect_errors
         events = [
             build_test_event('Service Control Manager', 7031, 2, 1002,
                            SAMPLE_XML_ERROR, 'SERVICE_ERROR'),
@@ -285,26 +285,26 @@ class TestErrorDetection(unittest.TestCase):
         errors = detect_errors(events)
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]['level_name'], 'ERROR')
-        self.assertTrue(errors[0]['known_pattern'])
+        self.assertTrue(errors[0]['known'])
         self.assertIn('Crash', errors[0]['title'])
         print(f"  Detected: {errors[0]['title']}")
 
     def test_detect_driver_issue(self):
         """Should detect driver timeout (Kernel-PnP 219)."""
-        from analyze_logs import detect_errors
+        from analyzer import detect_errors
         events = [
             build_test_event('Microsoft-Windows-Kernel-PnP', 219, 3, 1003,
                            SAMPLE_XML_WARNING, 'DRIVER_ISSUE'),
         ]
         errors = detect_errors(events)
         self.assertEqual(len(errors), 1)
-        self.assertTrue(errors[0]['known_pattern'])
+        self.assertTrue(errors[0]['known'])
         self.assertIn('Driver', errors[0]['title'])
         print(f"  Detected: {errors[0]['title']}")
 
     def test_ignore_info_events(self):
         """Should NOT flag level=4 (Information) events as errors."""
-        from analyze_logs import detect_errors
+        from analyzer import detect_errors
         events = [
             build_test_event('SomeProvider', 100, 4, 1004),
         ]
@@ -314,13 +314,13 @@ class TestErrorDetection(unittest.TestCase):
 
     def test_unknown_pattern_still_detected(self):
         """Unknown provider/event should still be flagged if level is error/warning."""
-        from analyze_logs import detect_errors
+        from analyzer import detect_errors
         events = [
             build_test_event('UnknownProvider-XYZ', 9999, 2, 1005),
         ]
         errors = detect_errors(events)
         self.assertEqual(len(errors), 1)
-        self.assertFalse(errors[0]['known_pattern'])
+        self.assertFalse(errors[0]['known'])
         self.assertIn('UnknownProvider-XYZ', errors[0]['title'])
         print(f"  Detected unknown: {errors[0]['title']}")
 
@@ -339,28 +339,28 @@ class TestCheckpointLifecycle(unittest.TestCase):
         """New checkpoint should start with empty state."""
         from collector import CheckpointManager
         mgr = CheckpointManager(self.ckpt_file)
-        self.assertEqual(mgr.get_last_record_id('System'), 0)
+        self.assertEqual(mgr.get('System'), 0)
         print("  Fresh checkpoint: record_id=0 for new channel")
 
     def test_save_and_load_checkpoint(self):
         """Saved checkpoint should be recoverable on reload."""
         from collector import CheckpointManager
         mgr = CheckpointManager(self.ckpt_file)
-        mgr.update_checkpoint('System', 12345)
-        mgr.update_checkpoint('Kernel-Power', 67890)
+        mgr.update('System', 12345)
+        mgr.update('Kernel-Power', 67890)
         mgr.save()
 
         # Reload
         mgr2 = CheckpointManager(self.ckpt_file)
-        self.assertEqual(mgr2.get_last_record_id('System'), 12345)
-        self.assertEqual(mgr2.get_last_record_id('Kernel-Power'), 67890)
+        self.assertEqual(mgr2.get('System'), 12345)
+        self.assertEqual(mgr2.get('Kernel-Power'), 67890)
         print("  Checkpoint save/load verified: System=12345, Kernel-Power=67890")
 
     def test_checkpoint_file_is_valid_json(self):
         """Checkpoint file should contain valid JSON."""
         from collector import CheckpointManager
         mgr = CheckpointManager(self.ckpt_file)
-        mgr.update_checkpoint('Test', 100)
+        mgr.update('Test', 100)
         mgr.save()
 
         with open(self.ckpt_file, 'r') as f:
@@ -373,7 +373,7 @@ class TestCheckpointLifecycle(unittest.TestCase):
         """Checkpoint save should not leave .tmp files behind."""
         from collector import CheckpointManager
         mgr = CheckpointManager(self.ckpt_file)
-        mgr.update_checkpoint('System', 999)
+        mgr.update('System', 999)
         mgr.save()
 
         tmp_file = self.ckpt_file + '.tmp'
@@ -387,65 +387,65 @@ class TestErrorClassification(unittest.TestCase):
 
     def test_classify_kernel_power_41(self):
         """Kernel-Power 41 should be classified as SYSTEM_FAULT."""
-        from collector import ErrorClassifier
-        result = ErrorClassifier.classify('Microsoft-Windows-Kernel-Power', 41, 1)
+        from collector import classify_event
+        result = classify_event('Microsoft-Windows-Kernel-Power', 41, 1)
         self.assertEqual(result['fault_type'], 'SYSTEM_FAULT')
         self.assertEqual(result['severity'], 'CRITICAL')
         print(f"  Kernel-Power 41 -> {result['fault_type']} ({result['severity']})")
 
     def test_classify_scm_7031(self):
         """Service Control Manager 7031 should be SERVICE_ERROR."""
-        from collector import ErrorClassifier
-        result = ErrorClassifier.classify('Service Control Manager', 7031, 2)
+        from collector import classify_event
+        result = classify_event('Service Control Manager', 7031, 2)
         self.assertEqual(result['fault_type'], 'SERVICE_ERROR')
         self.assertEqual(result['severity'], 'ERROR')
         print(f"  SCM 7031 -> {result['fault_type']} ({result['severity']})")
 
     def test_classify_driver_pnp(self):
         """Kernel-PnP 219 should be DRIVER_ISSUE."""
-        from collector import ErrorClassifier
-        result = ErrorClassifier.classify('Microsoft-Windows-Kernel-PnP', 219, 3)
+        from collector import classify_event
+        result = classify_event('Microsoft-Windows-Kernel-PnP', 219, 3)
         self.assertEqual(result['fault_type'], 'DRIVER_ISSUE')
         print(f"  Kernel-PnP 219 -> {result['fault_type']}")
 
     def test_classify_dcom_security(self):
         """DistributedCOM 10016 should be SECURITY_EVENT."""
-        from collector import ErrorClassifier
-        result = ErrorClassifier.classify('Microsoft-Windows-DistributedCOM', 10016, 3)
+        from collector import classify_event
+        result = classify_event('Microsoft-Windows-DistributedCOM', 10016, 3)
         self.assertEqual(result['fault_type'], 'SECURITY_EVENT')
         print(f"  DCOM 10016 -> {result['fault_type']}")
 
     def test_classify_update_error(self):
         """WindowsUpdateClient should be UPDATE_ERROR."""
-        from collector import ErrorClassifier
-        result = ErrorClassifier.classify('Microsoft-Windows-WindowsUpdateClient', 20, 2)
+        from collector import classify_event
+        result = classify_event('Microsoft-Windows-WindowsUpdateClient', 20, 2)
         self.assertEqual(result['fault_type'], 'UPDATE_ERROR')
         print(f"  WUC 20 -> {result['fault_type']}")
 
     def test_classify_storage_error(self):
         """Volsnap should be STORAGE_ERROR."""
-        from collector import ErrorClassifier
-        result = ErrorClassifier.classify('Volsnap', 25, 2)
+        from collector import classify_event
+        result = classify_event('Volsnap', 25, 2)
         self.assertEqual(result['fault_type'], 'STORAGE_ERROR')
         print(f"  Volsnap 25 -> {result['fault_type']}")
 
     def test_classify_unknown_by_level(self):
         """Unknown provider at level 1 should still get SYSTEM_FAULT."""
-        from collector import ErrorClassifier
-        result = ErrorClassifier.classify('TotallyUnknownProvider', 9999, 1)
+        from collector import classify_event
+        result = classify_event('TotallyUnknownProvider', 9999, 1)
         self.assertEqual(result['fault_type'], 'SYSTEM_FAULT')
         self.assertEqual(result['severity'], 'CRITICAL')
         print(f"  Unknown lv1 -> {result['fault_type']} (level-based fallback)")
 
     def test_diagnostic_context_alerts(self):
         """Diagnostic context should flag high resource usage."""
-        from collector import ErrorClassifier
+        from collector import build_diagnostic_context
         resources = {
             'cpu_usage_percent': 95.0,
             'memory_usage_percent': 92.0,
             'disk_free_percent': 5.0
         }
-        ctx = ErrorClassifier.get_diagnostic_context({}, resources)
+        ctx = build_diagnostic_context(resources)
         alerts = ctx['resource_alerts']
         self.assertTrue(any('HIGH CPU' in a for a in alerts))
         self.assertTrue(any('HIGH MEMORY' in a for a in alerts))
@@ -511,7 +511,7 @@ class TestAnalyzeCollectedData(unittest.TestCase):
         with open(self.test_file, 'w', encoding='utf-8') as f:
             json.dump(data, f)
 
-        from analyze_logs import load_events, detect_errors
+        from analyzer import load_events, detect_errors
         loaded = load_events(self.test_file)
         self.assertEqual(len(loaded['events']), 3)
 
@@ -543,17 +543,17 @@ class TestFaultDiagnosisOutput(unittest.TestCase):
         ]
         data = build_test_data(events)
 
-        from analyze_logs import export_summary
-        export_summary(data, self.output_file)
+        from analyzer import export_detailed_report
+        export_detailed_report(data, self.output_file)
 
         with open(self.output_file, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        self.assertIn('FAULT DIAGNOSIS', content)
+        self.assertIn('FAULT SUMMARY', content)
         self.assertIn('CRITICAL', content)
         self.assertIn('Unexpected Shutdown', content)
         self.assertIn('Crash', content)
-        self.assertIn('Actions', content)
+        self.assertIn('Solutions', content)
         print("  Fault diagnosis report contains expected sections")
 
     def test_export_healthy_system(self):
@@ -564,8 +564,8 @@ class TestFaultDiagnosisOutput(unittest.TestCase):
         ]
         data = build_test_data(events)
 
-        from analyze_logs import export_summary
-        export_summary(data, self.output_file)
+        from analyzer import export_detailed_report
+        export_detailed_report(data, self.output_file)
 
         with open(self.output_file, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -579,7 +579,7 @@ class TestMalformedDataHandling(unittest.TestCase):
 
     def test_handle_empty_events(self):
         """Should handle empty events list without crashing."""
-        from analyze_logs import detect_errors, generate_resource_alerts
+        from analyzer import detect_errors, generate_resource_alerts
         errors = detect_errors([])
         alerts = generate_resource_alerts([])
         self.assertEqual(len(errors), 0)
@@ -588,7 +588,7 @@ class TestMalformedDataHandling(unittest.TestCase):
 
     def test_handle_missing_fields(self):
         """Should handle events with missing fields."""
-        from analyze_logs import detect_errors
+        from analyzer import detect_errors
         events = [
             {'level': 2},  # Minimal event
             {},  # Completely empty event
@@ -602,7 +602,7 @@ class TestMalformedDataHandling(unittest.TestCase):
 
     def test_handle_none_values(self):
         """Should handle None values in event fields."""
-        from analyze_logs import detect_errors
+        from analyzer import detect_errors
         events = [
             {
                 'provider_name': None,
@@ -620,16 +620,15 @@ class TestMalformedDataHandling(unittest.TestCase):
         """XML parser should handle garbage input without crashing."""
         from collector import extract_event_metadata
         result = extract_event_metadata("not valid xml at all <><>")
-        # Should return something (possibly with missing fields) but not crash
-        # The regex-based parser will return partial results
-        self.assertIsNotNone(result)
+        # The refactored parser returns None when no EventRecordID is found
+        self.assertIsNone(result)
         print("  Garbage XML handled without crash")
 
     def test_xml_parsing_with_empty_string(self):
         """XML parser should handle empty string."""
         from collector import extract_event_metadata
         result = extract_event_metadata("")
-        self.assertIsNotNone(result)
+        self.assertIsNone(result)
         print("  Empty XML handled without crash")
 
 
@@ -702,7 +701,7 @@ class TestResourceAlerts(unittest.TestCase):
 
     def test_high_cpu_alert(self):
         """Should detect high CPU usage."""
-        from analyze_logs import generate_resource_alerts
+        from analyzer import generate_resource_alerts
         events = [build_test_event('P', 1, 3, 1, cpu=95.0)]
         alerts = generate_resource_alerts(events)
         self.assertTrue(any(a['type'] == 'HIGH_CPU' for a in alerts))
@@ -710,7 +709,7 @@ class TestResourceAlerts(unittest.TestCase):
 
     def test_high_memory_alert(self):
         """Should detect high memory usage."""
-        from analyze_logs import generate_resource_alerts
+        from analyzer import generate_resource_alerts
         events = [build_test_event('P', 1, 3, 1, mem=95.0)]
         alerts = generate_resource_alerts(events)
         self.assertTrue(any(a['type'] == 'HIGH_MEMORY' for a in alerts))
@@ -718,7 +717,7 @@ class TestResourceAlerts(unittest.TestCase):
 
     def test_low_disk_alert(self):
         """Should detect low disk space."""
-        from analyze_logs import generate_resource_alerts
+        from analyzer import generate_resource_alerts
         events = [build_test_event('P', 1, 3, 1, disk=5.0)]
         alerts = generate_resource_alerts(events)
         self.assertTrue(any(a['type'] == 'LOW_DISK' for a in alerts))
@@ -726,7 +725,7 @@ class TestResourceAlerts(unittest.TestCase):
 
     def test_no_alerts_normal_resources(self):
         """Should not alert on normal resource usage."""
-        from analyze_logs import generate_resource_alerts
+        from analyzer import generate_resource_alerts
         events = [build_test_event('P', 1, 3, 1, cpu=30.0, mem=50.0, disk=60.0)]
         alerts = generate_resource_alerts(events)
         self.assertEqual(len(alerts), 0)

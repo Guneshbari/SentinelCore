@@ -40,10 +40,10 @@ sys.path.insert(0, SRC_DIR)
 
 from collector import (
     is_admin, collect_events_from_channel, extract_event_metadata,
-    ErrorClassifier, generate_event_hash, get_resource_snapshot,
-    get_system_id, CheckpointManager
+    classify_event, build_diagnostic_context, generate_event_hash,
+    get_resource_snapshot, get_system_id, CheckpointManager
 )
-from analyze_logs import detect_errors, generate_resource_alerts, LEVEL_NAMES
+from analyzer import detect_errors, generate_resource_alerts, LEVEL_NAMES
 
 
 DIVIDER = "=" * 80
@@ -95,10 +95,10 @@ def test_real_error_detection():
     for event in raw_events:
         meta = event['metadata']
         resources = get_resource_snapshot()
-        fault_info = ErrorClassifier.classify(
+        fault_info = classify_event(
             meta['provider_name'], meta['event_id'], meta['level']
         )
-        diag_ctx = ErrorClassifier.get_diagnostic_context(meta, resources)
+        diag_ctx = build_diagnostic_context(resources)
 
         processed_events.append({
             'log_channel': event['log_channel'],
@@ -144,8 +144,8 @@ def test_real_error_detection():
     print(f"    Errors/Warnings detected: {len(detected_errors)}")
 
     if detected_errors:
-        known = [e for e in detected_errors if e.get('known_pattern')]
-        unknown = [e for e in detected_errors if not e.get('known_pattern')]
+        known = [e for e in detected_errors if e.get('known')]
+        unknown = [e for e in detected_errors if not e.get('known')]
 
         print(f"    Known patterns matched:   {len(known)}")
         print(f"    Unknown patterns:         {len(unknown)}")
@@ -159,7 +159,7 @@ def test_real_error_detection():
         print(f"\n    Unique Error Patterns Found ({len(pattern_counts)}):")
         for (provider, eid, title), count in pattern_counts.most_common(20):
             is_known = any(
-                e['known_pattern'] for e in detected_errors
+                e['known'] for e in detected_errors
                 if e['provider_name'] == provider and e['event_id'] == eid
             )
             marker = "\u2714 DETECTED" if is_known else "? UNKNOWN"
@@ -171,7 +171,7 @@ def test_real_error_detection():
             print(f"      [{marker:10s}] [{level:8s}] {title:40s} x{count}")
 
         # Show diagnosed issues with root cause
-        diagnosed = [e for e in detected_errors if e.get('known_pattern')]
+        diagnosed = [e for e in detected_errors if e.get('known')]
         if diagnosed:
             seen = set()
             print(f"\n    Root Cause Analysis:")
@@ -188,8 +188,8 @@ def test_real_error_detection():
                 if err.get('causes'):
                     for c in err['causes'][:3]:
                         print(f"        Cause: {c}")
-                if err.get('actions'):
-                    for a in err['actions'][:3]:
+                if err.get('solutions'):
+                    for a in err['solutions'][:3]:
                         print(f"        Action: {a}")
     else:
         print("\n    \u2713 No errors or warnings found in collected events.")
@@ -203,7 +203,7 @@ def test_real_error_detection():
     # Verdict
     print_section("VERDICT")
     if detected_errors:
-        known_count = sum(1 for e in detected_errors if e.get('known_pattern'))
+        known_count = sum(1 for e in detected_errors if e.get('known'))
         print(f"    \u2714 ERROR DETECTION IS WORKING: Found {len(detected_errors)} real issues")
         print(f"    \u2714 Pattern matching working: {known_count} matched known signatures")
         print(f"    \u2714 Fault classification working: {len(fault_counts)} fault types assigned")
@@ -314,7 +314,7 @@ def generate_and_detect_error(collect_seconds=15):
     for event in new_raw:
         meta = event['metadata']
         resources = get_resource_snapshot()
-        fault_info = ErrorClassifier.classify(
+        fault_info = classify_event(
             meta['provider_name'], meta['event_id'], meta['level']
         )
         new_events.append({
@@ -344,7 +344,7 @@ def generate_and_detect_error(collect_seconds=15):
     if detected:
         print(f"    \u2714 ERRORS DETECTED: {len(detected)}")
         for err in detected:
-            marker = "\u2714 KNOWN" if err.get('known_pattern') else "? UNKNOWN"
+            marker = "\u2714 KNOWN" if err.get('known') else "? UNKNOWN"
             print(f"      [{marker}] [{err['level_name']}] {err['title']}")
             if err.get('diagnosis'):
                 print(f"        Diagnosis: {err['diagnosis']}")
@@ -398,9 +398,9 @@ def save_live_report(events, detected_errors, output_file="live_test_report.txt"
                     f.write(f"  Causes:\n")
                     for c in err['causes']:
                         f.write(f"    - {c}\n")
-                if err.get('actions'):
+                if err.get('solutions'):
                     f.write(f"  Actions:\n")
-                    for a in err['actions']:
+                    for a in err['solutions']:
                         f.write(f"    -> {a}\n")
                 f.write("\n")
 

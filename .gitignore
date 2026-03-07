@@ -39,3 +39,8 @@ test_results.txt
 .env.*.local
 secrets.json
 config.local.json
+
+# Tooling and Temp Files
+.agents/
+status.txt
+status.json

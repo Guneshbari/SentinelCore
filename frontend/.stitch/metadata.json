@@ -1,0 +1,53 @@
+{
+  "name": "projects/17935057977304664513",
+  "projectId": "17935057977304664513",
+  "title": "SentinelCore Dashboard",
+  "visibility": "PRIVATE",
+  "projectType": "PROJECT_DESIGN",
+  "origin": "STITCH",
+  "deviceType": "DESKTOP",
+  "designTheme": {
+    "colorMode": "DARK",
+    "font": "INTER",
+    "roundness": "ROUND_TWELVE",
+    "customColor": "#3c83f6",
+    "saturation": 3
+  },
+  "screens": {
+    "overview": {
+      "id": "21e5fe78737849f3b81932d01402acbb",
+      "sourceScreen": "projects/17935057977304664513/screens/21e5fe78737849f3b81932d01402acbb",
+      "title": "SentinelCore Observability Overview",
+      "width": 2560,
+      "height": 2048
+    },
+    "events": {
+      "id": "e1486cbc1ea34ce9b9854a99973cb67f",
+      "sourceScreen": "projects/17935057977304664513/screens/e1486cbc1ea34ce9b9854a99973cb67f",
+      "title": "SentinelCore Event Explorer",
+      "width": 2560,
+      "height": 2048
+    },
+    "systems": {
+      "id": "7fb41957386849d7b4b9f42157d05389",
+      "sourceScreen": "projects/17935057977304664513/screens/7fb41957386849d7b4b9f42157d05389",
+      "title": "SentinelCore Systems Monitor",
+      "width": 2560,
+      "height": 2048
+    },
+    "alerts": {
+      "id": "7a43adfe4ecb412fbc41f7b5ad424963",
+      "sourceScreen": "projects/17935057977304664513/screens/7a43adfe4ecb412fbc41f7b5ad424963",
+      "title": "SentinelCore Alerts Management",
+      "width": 2560,
+      "height": 2048
+    },
+    "analytics": {
+      "id": "e5c6b634c99e4154b766bd7346c4576b",
+      "sourceScreen": "projects/17935057977304664513/screens/e5c6b634c99e4154b766bd7346c4576b",
+      "title": "SentinelCore Analytics Dashboard",
+      "width": 2560,
+      "height": 2048
+    }
+  }
+}

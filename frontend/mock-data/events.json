@@ -1,0 +1,10 @@
+{
+  "endpoint": "GET /api/events",
+  "data": [
+    {
+      "id": "evt-001",
+      "level": "ERROR",
+      "message": "Service terminated unexpectedly"
+    }
+  ]
+}

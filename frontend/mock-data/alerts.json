@@ -1,0 +1,10 @@
+{
+  "endpoint": "GET /api/alerts",
+  "data": [
+    {
+      "alert_id": "ALT-001",
+      "rule": "High CPU",
+      "severity": "warning"
+    }
+  ]
+}

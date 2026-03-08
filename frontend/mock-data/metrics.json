@@ -1,0 +1,8 @@
+{
+  "endpoint": "GET /api/metrics",
+  "data": {
+    "cpu_usage_percent": 42.7,
+    "memory_usage_mb": 3128,
+    "active_connections": 234
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "endpoint": "GET /api/systems",
+  "data": [
+    {
+      "system_id": "SYS-001",
+      "hostname": "PROD-WEB-01",
+      "status": "online"
+    }
+  ]
+}

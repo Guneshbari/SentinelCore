@@ -1,29 +1,31 @@
 import { Server, Activity, AlertTriangle, Zap } from 'lucide-react';
 import DashboardCard from '../components/shared/DashboardCard';
 import SystemHealthHeatmap from '../components/shared/SystemHealthHeatmap';
+import LiveEventStream from '../components/shared/LiveEventStream';
 import EventRateChart from '../components/charts/EventRateChart';
 import SeverityChart from '../components/charts/SeverityChart';
 import FaultTypesChart from '../components/charts/FaultTypesChart';
 import SeverityBadge from '../components/shared/SeverityBadge';
 import {
   systems,
-  events,
   getActiveAlerts,
   getDegradedSystems,
   getCriticalAlertCount,
   formatTimestamp,
 } from '../data/mockData';
+import { useDashboard } from '../context/DashboardContext';
 
 export default function OverviewPage() {
+  const { filteredEvents } = useDashboard();
   const degraded = getDegradedSystems();
   const criticalAlerts = getCriticalAlertCount();
   const activeAlerts = getActiveAlerts().length;
 
-  // Recent critical/error events
-  const recentCritical = events
+  // Recent critical/error events from filtered set
+  const recentCritical = filteredEvents
     .filter((e) => e.severity === 'CRITICAL' || e.severity === 'ERROR')
     .sort((a, b) => new Date(b.event_time).getTime() - new Date(a.event_time).getTime())
-    .slice(0, 10);
+    .slice(0, 8);
 
   return (
     <div className="space-y-5">
@@ -33,60 +35,82 @@ export default function OverviewPage() {
         <p className="text-xs text-text-muted mt-0.5">System telemetry & alert activity overview</p>
       </div>
 
-      {/* KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-        <DashboardCard
-          title="Systems Online"
-          value={systems.filter(s => s.status === 'online').length}
-          subtitle={degraded > 0 ? `${degraded} degraded` : 'All healthy'}
-          subtitleColor={degraded > 0 ? 'text-accent-amber' : 'text-accent-green'}
-          icon={<Server className="w-5 h-5 text-accent-blue" />}
-          iconBg="bg-accent-blue/15"
-        />
-        <DashboardCard
-          title="Systems Degraded"
-          value={degraded}
-          subtitle={degraded > 0 ? 'Requires attention' : 'None'}
-          subtitleColor={degraded > 0 ? 'text-accent-orange' : 'text-accent-green'}
-          icon={<Activity className="w-5 h-5 text-accent-orange" />}
-          iconBg="bg-accent-orange/15"
-        />
-        <DashboardCard
-          title="Critical Alerts"
-          value={criticalAlerts}
-          subtitle={`${activeAlerts} total active`}
-          subtitleColor="text-accent-red"
-          icon={<AlertTriangle className="w-5 h-5 text-accent-red" />}
-          iconBg="bg-accent-red/15"
-          pulse={criticalAlerts > 0}
-        />
-        <DashboardCard
-          title="Events Last Hour"
-          value={events.length.toLocaleString()}
-          subtitle="+342 ingested"
-          subtitleColor="text-text-secondary"
-          icon={<Zap className="w-5 h-5 text-accent-blue" />}
-          iconBg="bg-accent-blue/15"
-        />
+      {/* ── Top Row: KPI Strip + Pipeline Status ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-3">
+        <div className="lg:col-span-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          <DashboardCard
+            title="Systems Online"
+            value={systems.filter(s => s.status === 'online').length}
+            subtitle={degraded > 0 ? `${degraded} degraded` : 'All healthy'}
+            subtitleColor={degraded > 0 ? 'text-accent-amber' : 'text-signal-highlight'}
+            icon={<Server className="w-5 h-5 text-signal-primary" />}
+            iconBg="bg-signal-primary/15"
+          />
+          <DashboardCard
+            title="Systems Degraded"
+            value={degraded}
+            subtitle={degraded > 0 ? 'Requires attention' : 'None'}
+            subtitleColor={degraded > 0 ? 'text-accent-orange' : 'text-signal-highlight'}
+            icon={<Activity className="w-5 h-5 text-accent-orange" />}
+            iconBg="bg-accent-orange/15"
+          />
+          <DashboardCard
+            title="Critical Alerts"
+            value={criticalAlerts}
+            subtitle={`${activeAlerts} total active`}
+            subtitleColor="text-accent-red"
+            icon={<AlertTriangle className="w-5 h-5 text-accent-red" />}
+            iconBg="bg-accent-red/15"
+            pulse={criticalAlerts > 0}
+          />
+          <DashboardCard
+            title="Filtered Events"
+            value={filteredEvents.length.toLocaleString()}
+            subtitle="matching filters"
+            subtitleColor="text-text-secondary"
+            icon={<Zap className="w-5 h-5 text-signal-primary" />}
+            iconBg="bg-signal-primary/15"
+          />
+        </div>
+        {/* Pipeline Status Panel */}
+        <div className="glass-panel panel-glow rounded-xl p-5 animate-fade-in flex flex-col justify-center">
+          <h3 className="text-[10px] font-semibold text-text-muted uppercase tracking-[0.1em] mb-3">Pipeline Status</h3>
+          <div className="space-y-2.5">
+            {[
+              { label: 'Kafka Ingestion', status: 'ok' },
+              { label: 'PostgreSQL Sink', status: 'ok' },
+              { label: 'Alert Engine', status: 'ok' },
+            ].map((p) => (
+              <div key={p.label} className="flex items-center justify-between">
+                <span className="text-xs text-text-secondary">{p.label}</span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-signal-highlight shadow-[0_0_6px_rgba(34,197,94,0.5)]" />
+                  <span className="text-[10px] text-signal-highlight font-medium">OK</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
 
-      {/* System Health Heatmap */}
-      <SystemHealthHeatmap />
-
-      {/* Charts Row */}
+      {/* ── Middle Row: Health Heatmap + Live Event Stream ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <SystemHealthHeatmap />
+        <LiveEventStream />
+      </div>
+
+      {/* ── Bottom Row: Event Rate + Severity + Fault Types ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <EventRateChart />
         <SeverityChart />
+        <FaultTypesChart />
       </div>
 
-      {/* Bottom Row: Fault Types + Recent Critical */}
-      <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-        <div className="lg:col-span-3">
-          <FaultTypesChart />
-        </div>
-        <div className="lg:col-span-2 glass-panel rounded-xl p-4 animate-fade-in">
+      {/* Recent Critical Events */}
+      {recentCritical.length > 0 && (
+        <div className="glass-panel panel-glow rounded-xl p-4 animate-fade-in">
           <h3 className="text-xs font-semibold text-text-primary uppercase tracking-wider mb-3">Recent Critical Events</h3>
-          <div className="space-y-1">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-1">
             {recentCritical.map((e) => (
               <div
                 key={e.event_record_id}
@@ -103,7 +127,7 @@ export default function OverviewPage() {
             ))}
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

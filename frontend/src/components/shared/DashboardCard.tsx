@@ -16,11 +16,11 @@ export default function DashboardCard({
   subtitle,
   subtitleColor = 'text-text-secondary',
   icon,
-  iconBg = 'bg-accent-blue/15',
+  iconBg = 'bg-signal-primary/15',
   pulse = false,
 }: DashboardCardProps) {
   return (
-    <div className="glass-panel rounded-xl p-5 hover:border-border-hover transition-all duration-200 animate-fade-in group">
+    <div className="glass-panel panel-glow hover-lift rounded-xl p-5 animate-fade-in group">
       <div className="flex items-start justify-between">
         <div>
           <p className="text-[10px] font-semibold text-text-muted uppercase tracking-[0.1em] mb-2">

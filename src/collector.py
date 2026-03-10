@@ -282,6 +282,18 @@ _CLASSIFICATION_RULES = [
     ('WindowsUpdateClient', None,          'UPDATE_ERROR'),
     ('Volsnap', None,                      'STORAGE_ERROR'),
     ('Ntfs', None,                         'STORAGE_ERROR'),
+     ('DistributedCOM',         None,       'SECURITY_EVENT'),
+    ('Netwtw14',               None,       'DRIVER_ISSUE'),
+    ('TPM-WMI',                None,       'SECURITY_EVENT'),
+    ('Hyper-V',                None,       'DRIVER_ISSUE'),
+    ('NDIS',                   None,       'DRIVER_ISSUE'),
+    ('Win32k',                 None,       'SYSTEM_FAULT'),
+    ('Application-Experience', None,       'SERVICE_ERROR'),
+    ('UserModePowerService',   None,       'RESOURCE_WARNING'),
+    ('Time-Service',  None,  'SERVICE_ERROR'),
+    ('Server',        None,  'SERVICE_ERROR'),
+    ('TPM',           None,  'SECURITY_EVENT'),
+    ('WHEA-Logger',   None,  'SYSTEM_FAULT'), 
 ]
 
 
@@ -596,6 +608,7 @@ class KafkaManager:
             return result
 
         system_id = payload.get('system_id', 'unknown')
+        futures = []
         for event in payload.get('events', []):
             msg = {
                 'system_id':           system_id,
@@ -605,16 +618,23 @@ class KafkaManager:
                 'event':               event
             }
             try:
-                self.producer.send(self.topic, key=system_id, value=msg).get(timeout=10)
+                futures.append((event, self.producer.send(self.topic, key=system_id, value=msg)))
+            except Exception as e:
+                result['failed'] += 1
+                logger.error(f"Send error: {e}")
+
+        # Confirm all at once
+        for event, future in futures:
+            try:
+                future.get(timeout=30)
                 result['sent'] += 1
             except (KafkaError, Exception) as e:
                 result['failed'] += 1
-                logger.error(f"Delivery failed for {event.get('event_hash', '?')[:12]}: {e}")
-
-        try:
-            self.producer.flush(timeout=30)
-        except Exception:
-            pass
+                logger.error(f"Delivery failed for {event.get('event_hash','?')[:12]}: {e}")
+                try:
+                    self.producer.flush(timeout=30)
+                except Exception:
+                    pass
 
         result['success'] = result['failed'] == 0
         return result

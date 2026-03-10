@@ -1,9 +1,10 @@
 import { useNavigate } from 'react-router-dom';
-import { systems, events } from '../../data/mockData';
-import type { SystemInfo, Severity } from '../../types/telemetry';
+import { systems } from '../../data/mockData';
+import { useDashboard } from '../../context/DashboardContext';
+import type { SystemInfo } from '../../types/telemetry';
 
-function getHealthScore(system: SystemInfo): { score: number; level: 'healthy' | 'warning' | 'error' | 'critical' } {
-  const systemEvents = events.filter((e) => e.system_id === system.system_id);
+function getHealthScore(system: SystemInfo, filteredEvents: { system_id: string; severity: string }[]): { score: number; level: 'healthy' | 'warning' | 'error' | 'critical' } {
+  const systemEvents = filteredEvents.filter((e) => e.system_id === system.system_id);
   const criticals = systemEvents.filter((e) => e.severity === 'CRITICAL').length;
   const errors = systemEvents.filter((e) => e.severity === 'ERROR').length;
   const warnings = systemEvents.filter((e) => e.severity === 'WARNING').length;
@@ -16,22 +17,23 @@ function getHealthScore(system: SystemInfo): { score: number; level: 'healthy' |
 }
 
 const levelColors: Record<string, { bg: string; border: string; text: string; glow: string }> = {
-  healthy: { bg: 'bg-[#34c759]/10', border: 'border-[#34c759]/30', text: 'text-[#34c759]', glow: '' },
+  healthy: { bg: 'bg-[#22c55e]/10', border: 'border-[#22c55e]/30', text: 'text-[#22c55e]', glow: '' },
   warning: { bg: 'bg-[#ffd60a]/10', border: 'border-[#ffd60a]/30', text: 'text-[#ffd60a]', glow: '' },
-  error: { bg: 'bg-[#ff9500]/10', border: 'border-[#ff9500]/30', text: 'text-[#ff9500]', glow: 'shadow-[0_0_12px_rgba(255,149,0,0.15)]' },
+  error: { bg: 'bg-[#ff7a18]/10', border: 'border-[#ff7a18]/30', text: 'text-[#ff7a18]', glow: 'shadow-[0_0_12px_rgba(255,122,24,0.15)]' },
   critical: { bg: 'bg-[#ff3b30]/10', border: 'border-[#ff3b30]/40', text: 'text-[#ff3b30]', glow: 'shadow-[0_0_16px_rgba(255,59,48,0.2)]' },
 };
 
 export default function SystemHealthHeatmap() {
   const navigate = useNavigate();
+  const { filteredEvents } = useDashboard();
 
   const systemHealth = systems.map((s) => ({
     ...s,
-    health: getHealthScore(s),
+    health: getHealthScore(s, filteredEvents),
   }));
 
   return (
-    <div className="glass-panel rounded-xl p-5 animate-fade-in">
+    <div className="glass-panel panel-glow rounded-xl p-5 animate-fade-in">
       <div className="flex items-center justify-between mb-4">
         <div>
           <h3 className="text-sm font-semibold text-text-primary">System Health Map</h3>

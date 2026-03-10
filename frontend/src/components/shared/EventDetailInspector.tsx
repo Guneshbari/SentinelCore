@@ -10,7 +10,8 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import SeverityBadge from './SeverityBadge';
-import { formatTimestamp, events } from '../../data/mockData';
+import { formatTimestamp } from '../../data/mockData';
+import { useDashboard } from '../../context/DashboardContext';
 import type { TelemetryEvent } from '../../types/telemetry';
 
 interface EventDetailInspectorProps {
@@ -21,8 +22,10 @@ interface EventDetailInspectorProps {
 export default function EventDetailInspector({ event, onClose }: EventDetailInspectorProps) {
   if (!event) return null;
 
-  // Build correlation timeline: find other events from same system around the same time
-  const systemEvents = events
+  const { filteredEvents } = useDashboard();
+
+  // Build correlation timeline: find other events from same system
+  const systemEvents = filteredEvents
     .filter((e) => e.system_id === event.system_id)
     .sort((a, b) => new Date(a.event_time).getTime() - new Date(b.event_time).getTime());
 
@@ -48,7 +51,7 @@ export default function EventDetailInspector({ event, onClose }: EventDetailInsp
   ];
 
   return (
-    <div className="glass-panel rounded-xl overflow-hidden animate-fade-in">
+    <div className="glass-panel panel-glow rounded-xl overflow-hidden animate-fade-in">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border">
         <div className="flex items-center gap-2">
@@ -89,19 +92,19 @@ export default function EventDetailInspector({ event, onClose }: EventDetailInsp
           <ComposedChart data={correlationData} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
             <defs>
               <linearGradient id="cpuCorr" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#0a84ff" stopOpacity={0.3} />
-                <stop offset="100%" stopColor="#0a84ff" stopOpacity={0} />
+                <stop offset="0%" stopColor="#00e5ff" stopOpacity={0.3} />
+                <stop offset="100%" stopColor="#00e5ff" stopOpacity={0} />
               </linearGradient>
             </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
-            <XAxis dataKey="time" tick={{ fill: '#6b7280', fontSize: 9 }} axisLine={false} tickLine={false} />
-            <YAxis tick={{ fill: '#6b7280', fontSize: 9 }} axisLine={false} tickLine={false} domain={[0, 100]} />
+            <CartesianGrid strokeDasharray="3 3" stroke="#1a2230" strokeOpacity={0.25} vertical={false} />
+            <XAxis dataKey="time" tick={{ fill: '#556171', fontSize: 9 }} axisLine={false} tickLine={false} />
+            <YAxis tick={{ fill: '#556171', fontSize: 9 }} axisLine={false} tickLine={false} domain={[0, 100]} />
             <Tooltip
-              contentStyle={{ backgroundColor: '#0b0f19', border: '1px solid #1f2937', borderRadius: 8, fontSize: 11, color: '#e5e7eb' }}
+              contentStyle={{ backgroundColor: '#05080f', border: '1px solid #1a2230', borderRadius: 8, fontSize: 11, color: '#e6edf3' }}
             />
-            <Area type="monotone" dataKey="cpu" stroke="#0a84ff" fill="url(#cpuCorr)" strokeWidth={1.5} name="CPU %" />
-            <Line type="monotone" dataKey="memory" stroke="#bf5af2" strokeWidth={1.5} dot={false} name="Memory %" />
-            <Line type="monotone" dataKey="disk" stroke="#64d2ff" strokeWidth={1} dot={false} strokeDasharray="4 2" name="Disk Free %" />
+            <Area type="monotone" dataKey="cpu" stroke="#00e5ff" fill="url(#cpuCorr)" strokeWidth={1.5} name="CPU %" />
+            <Line type="monotone" dataKey="memory" stroke="#8b5cf6" strokeWidth={1.5} dot={false} name="Memory %" />
+            <Line type="monotone" dataKey="disk" stroke="#22c55e" strokeWidth={1} dot={false} strokeDasharray="4 2" name="Disk Free %" />
           </ComposedChart>
         </ResponsiveContainer>
       </div>

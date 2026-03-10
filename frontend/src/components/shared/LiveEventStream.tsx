@@ -1,13 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
 import { Radio } from 'lucide-react';
 import SeverityBadge from './SeverityBadge';
-import { events, formatTimestamp } from '../../data/mockData';
+import { formatTimestamp } from '../../data/mockData';
+import { useDashboard } from '../../context/DashboardContext';
 import type { TelemetryEvent } from '../../types/telemetry';
 
 const MAX_VISIBLE = 12;
 
 export default function LiveEventStream() {
-  const [streamEvents, setStreamEvents] = useState<TelemetryEvent[]>(events.slice(0, 5));
+  const { filteredEvents } = useDashboard();
+  const [streamEvents, setStreamEvents] = useState<TelemetryEvent[]>(filteredEvents.slice(0, 5));
   const [isLive, setIsLive] = useState(true);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -15,10 +17,10 @@ export default function LiveEventStream() {
     if (!isLive) return;
     const interval = setInterval(() => {
       setStreamEvents((prev) => {
-        // Cycle through mock events to simulate new arrivals
-        const nextIdx = prev.length % events.length;
+        const nextIdx = prev.length % filteredEvents.length;
+        if (filteredEvents.length === 0) return prev;
         const newEvent = {
-          ...events[nextIdx],
+          ...filteredEvents[nextIdx],
           event_record_id: Date.now() + Math.random(),
           event_time: new Date().toISOString(),
         };
@@ -26,18 +28,18 @@ export default function LiveEventStream() {
       });
     }, 3000);
     return () => clearInterval(interval);
-  }, [isLive]);
+  }, [isLive, filteredEvents]);
 
   return (
-    <div className="glass-panel rounded-xl overflow-hidden animate-fade-in">
+    <div className="glass-panel panel-glow rounded-xl overflow-hidden animate-fade-in">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border">
         <div className="flex items-center gap-2">
-          <Radio className={`w-4 h-4 ${isLive ? 'text-accent-green neon-green' : 'text-text-muted'}`} />
+          <Radio className={`w-4 h-4 ${isLive ? 'text-signal-highlight neon-green' : 'text-text-muted'}`} />
           <h3 className="text-xs font-semibold text-text-primary uppercase tracking-wider">Live Event Stream</h3>
           {isLive && (
-            <span className="flex items-center gap-1 text-[10px] text-accent-green font-medium">
-              <span className="w-1.5 h-1.5 rounded-full bg-accent-green animate-pulse-glow" />
+            <span className="flex items-center gap-1 text-[10px] text-signal-highlight font-medium">
+              <span className="w-1.5 h-1.5 rounded-full bg-signal-highlight animate-pulse-glow" />
               LIVE
             </span>
           )}
@@ -47,7 +49,7 @@ export default function LiveEventStream() {
           className={`px-2.5 py-1 text-[10px] font-semibold rounded-md transition-colors ${
             isLive
               ? 'bg-accent-red/15 text-accent-red hover:bg-accent-red/25'
-              : 'bg-accent-green/15 text-accent-green hover:bg-accent-green/25'
+              : 'bg-signal-highlight/15 text-signal-highlight hover:bg-signal-highlight/25'
           }`}
         >
           {isLive ? 'PAUSE' : 'RESUME'}
@@ -66,7 +68,7 @@ export default function LiveEventStream() {
             <span className="text-text-muted font-mono whitespace-nowrap w-[110px] shrink-0">
               {formatTimestamp(e.event_time)}
             </span>
-            <span className="font-mono text-accent-blue w-[65px] shrink-0">{e.system_id}</span>
+            <span className="font-mono text-signal-primary w-[65px] shrink-0">{e.system_id}</span>
             <span className="w-[70px] shrink-0">
               <SeverityBadge severity={e.severity} />
             </span>

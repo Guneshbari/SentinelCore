@@ -33,6 +33,12 @@ except ImportError:
     print("ERROR: psycopg2 required. pip install psycopg2-binary", file=sys.stderr)
     sys.exit(1)
 
+try:
+    from prometheus_client import start_http_server, Counter, Histogram, Gauge
+except ImportError:
+    print("ERROR: prometheus-client required. pip install prometheus-client", file=sys.stderr)
+    sys.exit(1)
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -56,6 +62,19 @@ DB_MAX_BACKOFF       = 60     # seconds cap
 KAFKA_POLL_TIMEOUT_MS    = 3000
 KAFKA_CONSUMER_TIMEOUT_MS = 5000
 KAFKA_MAX_POLL_RECORDS   = 100
+
+PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "8000"))
+
+# ============================================================================
+# PROMETHEUS METRICS
+# ============================================================================
+
+events_ingested_total = Counter('events_ingested_total', 'Total number of events read from Kafka')
+events_processed_total = Counter('events_processed_total', 'Total number of events successfully inserted into the database')
+pipeline_errors_total = Counter('pipeline_errors_total', 'Total number of processing or database errors')
+processing_latency_ms = Histogram('processing_latency_ms', 'Time taken to process and insert a batch in milliseconds', buckets=[10, 50, 100, 250, 500, 1000, 2500, 5000])
+database_insert_latency = Histogram('database_insert_latency', 'Time taken for the database insert command in milliseconds', buckets=[10, 50, 100, 250, 500, 1000, 2500, 5000])
+kafka_consumer_lag = Gauge('kafka_consumer_lag', 'Approximate number of messages behind the latest offset')
 
 # ============================================================================
 # LOGGING
@@ -203,7 +222,11 @@ def process_message(msg_value: dict, cursor) -> bool:
         'diagnostic_context':   Json(event.get('diagnostic_context', {})),
         'raw_xml':              event.get('raw_xml'),
     }
+    
+    start_time = time.time()
     cursor.execute(INSERT_SQL, row)
+    database_insert_latency.observe((time.time() - start_time) * 1000.0)
+    
     return True
 
 # ============================================================================
@@ -217,6 +240,12 @@ def run_consumer():
     logger.info(f"PostgreSQL : {POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
     logger.info(f"Group ID   : {KAFKA_GROUP_ID}")
     logger.info("=" * 60)
+
+    try:
+        start_http_server(PROMETHEUS_PORT)
+        logger.info(f"Prometheus metrics exposed on port {PROMETHEUS_PORT}")
+    except Exception as e:
+        logger.error(f"Failed to start Prometheus metrics server: {e}")
 
     # ── Connect to PostgreSQL ────────────────────────────────────────────────
     db = DBManager()
@@ -282,10 +311,15 @@ def run_consumer():
 
             if not messages:
                 continue
+                
+            # Update metrics
+            batch_size = sum(len(records) for records in messages.values())
+            events_ingested_total.inc(batch_size)
 
             # Ensure DB is alive before touching data
             if not db.ensure():
                 logger.error("PostgreSQL unavailable — skipping batch (offsets NOT committed, will re-process).")
+                pipeline_errors_total.inc()
                 total_batch_fails += 1
                 time.sleep(5)
                 continue
@@ -295,20 +329,30 @@ def run_consumer():
 
             # ── Open cursor INSIDE the transaction scope ───────────────────
             cursor = db.new_cursor()
+            batch_start_time = time.time()
             try:
                 for tp, records in messages.items():
+                    # Crudely estimate lag based on highwater offset vs current offset
+                    highwater = consumer.highwater(tp)
+                    if highwater is not None:
+                        current_offset = records[-1].offset
+                        kafka_consumer_lag.set(max(0, highwater - current_offset))
+                
                     for record in records:
                         if _shutdown.is_set():
                             break
                         try:
                             process_message(record.value, cursor)
                             batch_inserted += 1
+                            events_processed_total.inc()
                         except psycopg2.Error as e:
                             logger.error(f"DB insert error: {e}")
+                            pipeline_errors_total.inc()
                             batch_failed = True
                             break
                         except Exception as e:
                             logger.error(f"Message processing error (skipping): {e}")
+                            pipeline_errors_total.inc()
                             total_skipped += 1
                     if batch_failed or _shutdown.is_set():
                         break
@@ -318,10 +362,13 @@ def run_consumer():
 
                 # Commit DB, then commit Kafka offsets
                 db.commit()
+                processing_latency_ms.observe((time.time() - batch_start_time) * 1000.0)
+                
                 try:
                     consumer.commit()
                 except KafkaError as e:
                     logger.error(f"Kafka offset commit failed: {e} — some messages may re-process")
+                    pipeline_errors_total.inc()
 
                 total_inserted += batch_inserted
                 if batch_inserted:
@@ -335,6 +382,7 @@ def run_consumer():
             except psycopg2.Error:
                 db.rollback()
                 logger.warning(f"Batch ROLLED BACK — offsets NOT committed, will re-process.")
+                pipeline_errors_total.inc()
                 total_batch_fails += 1
                 time.sleep(2)
 

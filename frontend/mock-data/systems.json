@@ -1,0 +1,10 @@
+{
+  "data": [
+    { "system_id": "SYS-001", "hostname": "PROD-WEB-01", "status": "online", "cpu_usage_percent": 42.3, "memory_usage_percent": 67.8, "disk_free_percent": 54.2, "os_version": "Windows Server 2022", "last_seen": "2026-03-08T14:23:10Z", "ip_address": "10.0.1.10", "total_events": 2847 },
+    { "system_id": "SYS-002", "hostname": "PROD-DB-01", "status": "degraded", "cpu_usage_percent": 89.3, "memory_usage_percent": 91.7, "disk_free_percent": 11.8, "os_version": "Windows Server 2022", "last_seen": "2026-03-08T14:15:00Z", "ip_address": "10.0.1.20", "total_events": 4215 },
+    { "system_id": "SYS-003", "hostname": "PROD-APP-01", "status": "online", "cpu_usage_percent": 55.7, "memory_usage_percent": 72.1, "disk_free_percent": 38.9, "os_version": "Windows Server 2019", "last_seen": "2026-03-08T14:22:45Z", "ip_address": "10.0.1.30", "total_events": 1893 },
+    { "system_id": "SYS-004", "hostname": "PROD-FILE-01", "status": "degraded", "cpu_usage_percent": 23.4, "memory_usage_percent": 45.2, "disk_free_percent": 8.7, "os_version": "Windows Server 2019", "last_seen": "2026-03-08T14:20:00Z", "ip_address": "10.0.1.40", "total_events": 987 },
+    { "system_id": "SYS-005", "hostname": "PROD-CACHE-01", "status": "online", "cpu_usage_percent": 54.2, "memory_usage_percent": 88.4, "disk_free_percent": 63.5, "os_version": "Windows Server 2022", "last_seen": "2026-03-08T14:23:05Z", "ip_address": "10.0.1.50", "total_events": 1562 },
+    { "system_id": "SYS-006", "hostname": "PROD-API-01", "status": "online", "cpu_usage_percent": 28.9, "memory_usage_percent": 48.3, "disk_free_percent": 71.1, "os_version": "Windows Server 2022", "last_seen": "2026-03-08T14:22:58Z", "ip_address": "10.0.1.60", "total_events": 1343 }
+  ]
+}

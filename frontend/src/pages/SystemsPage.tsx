@@ -1,8 +1,7 @@
 import { useNavigate } from 'react-router-dom';
 import { systems, events, timeAgo } from '../data/mockData';
 import ResourceGauge from '../components/shared/ResourceGauge';
-import { getHealthScore } from '../components/shared/SystemHealthHeatmap';
-import { useDashboard } from '../context/DashboardContext';
+
 import type { SystemStatus } from '../types/telemetry';
 
 const statusConfig: Record<SystemStatus, { color: string; label: string; dot: string; glow: string }> = {
@@ -13,7 +12,7 @@ const statusConfig: Record<SystemStatus, { color: string; label: string; dot: st
 
 export default function SystemsPage() {
   const navigate = useNavigate();
-  const { filteredEvents } = useDashboard();
+
   const onlineCount = systems.filter((s) => s.status === 'online').length;
   const degradedCount = systems.filter((s) => s.status === 'degraded').length;
 
@@ -44,7 +43,6 @@ export default function SystemsPage() {
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
         {systems.map((system) => {
           const status = statusConfig[system.status];
-          const health = getHealthScore(system, filteredEvents);
 
           // Recent event info
           const systemEvents = events.filter((e) => e.system_id === system.system_id);

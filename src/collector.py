@@ -59,6 +59,7 @@ except ImportError:
 # ============================================================================
 
 COLLECTOR_VERSION = "4.0.0"
+AGENT_VERSION = "2.1.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 CONFIG_FILE = os.path.join(PROJECT_ROOT, "config.json")
@@ -387,6 +388,19 @@ def get_uptime_seconds() -> int:
     except Exception:
         return 0
 
+
+def get_local_ip() -> str:
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "0.0.0.0"
+    finally:
+        s.close()
+    return ip
+
 # ============================================================================
 # RESOURCE MONITORING
 # ============================================================================
@@ -527,7 +541,7 @@ class LocalFileManager:
                 data = json.load(f)
 
             data['last_updated'] = payload.get('timestamp_collected')
-            data['system_info'] = {k: payload.get(k) for k in ('system_id', 'hostname', 'boot_session_id', 'os_version', 'uptime_seconds')}
+            data['system_info'] = payload.get('system_info', {k: payload.get(k) for k in ('system_id', 'hostname', 'boot_session_id', 'os_version', 'uptime_seconds')})
 
             new_events = payload.get('events', [])
             data['events'].extend(new_events)
@@ -615,6 +629,7 @@ class KafkaManager:
                 'hostname':            payload.get('hostname'),
                 'collector_version':   payload.get('collector_version'),
                 'timestamp_collected': payload.get('timestamp_collected'),
+                'system_info':         payload.get('system_info', {}),
                 'event':               event
             }
             try:
@@ -842,6 +857,7 @@ def run_collector():
     hostname       = get_hostname()
     boot_session   = get_boot_session_id()
     os_version     = get_os_version()
+    ip_address     = get_local_ip()
 
     print(f"\nSystem:   {system_id}  ({hostname})")
     print(f"OS:       {os_version}")
@@ -921,14 +937,23 @@ def run_collector():
                 if not batch_events:
                     continue
 
+                uptime = get_uptime_seconds()
                 payload = {
                     'system_id':           system_id,
                     'hostname':            hostname,
                     'boot_session_id':     boot_session,
                     'os_version':          os_version,
-                    'uptime_seconds':      get_uptime_seconds(),
+                    'uptime_seconds':      uptime,
                     'collector_version':   COLLECTOR_VERSION,
                     'timestamp_collected': datetime.now(timezone.utc).isoformat(),
+                    'system_info': {
+                        'system_id': system_id,
+                        'hostname': hostname,
+                        'ip_address': ip_address,
+                        'agent_version': AGENT_VERSION,
+                        'os_version': os_version,
+                        'uptime_seconds': uptime
+                    },
                     'events':              batch_events
                 }
 

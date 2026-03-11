@@ -2,6 +2,7 @@ import { Server, Activity, AlertTriangle, Zap } from 'lucide-react';
 import DashboardCard from '../components/shared/DashboardCard';
 import SystemHealthHeatmap from '../components/shared/SystemHealthHeatmap';
 import LiveEventStream from '../components/shared/LiveEventStream';
+import PipelineHealthPanel from '../components/shared/PipelineHealthPanel';
 import EventRateChart from '../components/charts/EventRateChart';
 import SeverityChart from '../components/charts/SeverityChart';
 import FaultTypesChart from '../components/charts/FaultTypesChart';
@@ -72,24 +73,9 @@ export default function OverviewPage() {
             iconBg="bg-signal-primary/15"
           />
         </div>
-        {/* Pipeline Status Panel */}
-        <div className="glass-panel panel-glow rounded-xl p-5 animate-fade-in flex flex-col justify-center">
-          <h3 className="text-[10px] font-semibold text-text-muted uppercase tracking-[0.1em] mb-3">Pipeline Status</h3>
-          <div className="space-y-2.5">
-            {[
-              { label: 'Kafka Ingestion', status: 'ok' },
-              { label: 'PostgreSQL Sink', status: 'ok' },
-              { label: 'Alert Engine', status: 'ok' },
-            ].map((p) => (
-              <div key={p.label} className="flex items-center justify-between">
-                <span className="text-xs text-text-secondary">{p.label}</span>
-                <span className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-signal-highlight shadow-[0_0_6px_rgba(34,197,94,0.5)]" />
-                  <span className="text-[10px] text-signal-highlight font-medium">OK</span>
-                </span>
-              </div>
-            ))}
-          </div>
+        {/* Pipeline Health Panel */}
+        <div className="flex flex-col justify-center">
+          <PipelineHealthPanel />
         </div>
       </div>
 

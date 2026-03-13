@@ -18,7 +18,7 @@ import argparse
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple, cast
 
 # ============================================================================
 # CONSTANTS
@@ -420,14 +420,16 @@ def extract_event_description(raw_xml: str) -> Optional[str]:
 
         msg = root.find('.//e:RenderingInfo/e:Message', ns)
         if msg is not None and msg.text:
-            return msg.text.strip()
+            return cast(str, msg.text).strip()
 
         # Fallback: first 3 EventData values
-        parts = [
-            d.text.strip()
-            for d in (root.find('.//e:EventData', ns) or root.find('.//EventData') or [])
+        container = root.find('.//e:EventData', ns) or root.find('.//EventData')
+        all_parts = list(
+            cast(str, d.text).strip()
+            for d in (container if container is not None else [])
             if hasattr(d, 'text') and d.text
-        ][:3]
+        )
+        parts = cast(List[str], all_parts[:3])
         return ' | '.join(parts) or None
 
     except ET.ParseError:
@@ -489,7 +491,8 @@ def print_report(data: Dict):
 
     print("\nBy Severity:")
     for lvl, n in sorted(by_level.items()):
-        print(f"  {LEVEL_NAMES.get(lvl, f'LEVEL_{lvl}'):20s} {n:5d}  ({n/total*100:5.1f}%)")
+        lvl_int: int = cast(int, lvl)
+        print(f"  {LEVEL_NAMES.get(lvl_int, f'LEVEL_{lvl_int}'):20s} {n:5d}  ({n/total*100:5.1f}%)")
 
     print("\nBy Fault Type:")
     for ft, n in by_fault.most_common():
@@ -543,7 +546,9 @@ def print_report(data: Dict):
         if err:  print(f"    ✗ ERROR    : {err}")
         if warn: print(f"    ⚠ WARNING  : {warn}")
 
-        pattern_counts = Counter((e['provider_name'], e['event_id'], e['title']) for e in errors)
+        pattern_counts: Counter[Tuple[Any, Any, Any]] = Counter(  # type: ignore[call-overload]
+            (e['provider_name'], e['event_id'], e['title']) for e in errors
+        )
 
         print(f"\n  Unique Patterns ({len(pattern_counts)}):")
         print("  " + "-" * 76)
@@ -562,7 +567,8 @@ def print_report(data: Dict):
                 if key in seen:
                     continue
                 seen.add(key)
-                n = pattern_counts.get((e['provider_name'], e['event_id'], e['title']), 0)
+                key3: Tuple[Any, Any, Any] = (e['provider_name'], e['event_id'], e['title'])
+                n = pattern_counts.get(key3, 0)
                 print(f"\n    [{e['level_name']}] {e['title']}  (×{n})")
                 print(f"    Diagnosis: {e['diagnosis']}")
                 if e['causes']:
@@ -593,7 +599,9 @@ def export_detailed_report(data: Dict, output_file: str = "event_report.txt"):
     errors          = detect_errors(events)
     resource_alerts = generate_resource_alerts(events)
     insights        = analyze_patterns(events)
-    pattern_counts  = Counter((e['provider_name'], e['event_id'], e['title']) for e in errors)
+    pattern_counts: Counter[Tuple[Any, Any, Any]] = Counter(  # type: ignore[call-overload]
+        (e['provider_name'], e['event_id'], e['title']) for e in errors
+    )
 
     div  = "=" * 80
     dash = "-" * 80
@@ -641,7 +649,8 @@ def export_detailed_report(data: Dict, output_file: str = "event_report.txt"):
                 if key in seen:
                     continue
                 seen.add(key)
-                n = pattern_counts.get((e['provider_name'], e['event_id'], e['title']), 0)
+                key3: Tuple[Any, Any, Any] = (e['provider_name'], e['event_id'], e['title'])
+                n = pattern_counts.get(key3, 0)
                 w(f"  [{e['level_name']}] {e['title']}  (×{n})")
                 w(f"    Diagnosis: {e['diagnosis']}")
                 if e['causes']:
@@ -685,7 +694,7 @@ def export_detailed_report(data: Dict, output_file: str = "event_report.txt"):
 
             desc = extract_event_description(ev.get('raw_xml', ''))
             if desc:
-                w(f"       Desc    : {desc[:300]}")
+                w(f"       Desc    : {desc[:300]}")  # type: ignore[index]
 
             if lvl in (1, 2, 3):
                 kb_entry = error_map.get((provider, event_id))

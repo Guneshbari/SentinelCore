@@ -1,6 +1,6 @@
 {
   "kafka": {
-    "bootstrap_servers": "172.30.178.75:9092",
+    "bootstrap_servers": "YOUR_KAFKA_IP:9092",
     "topic": "sentinel-events",
     "client_id": "windows-test-agent",
     "acks": "all",
@@ -10,7 +10,7 @@
     "request_timeout_ms": 15000
   },
   "agent": {
-    "system_id_mode": "AUTO",
+    "system_id_mode": "GUIDE",
     "batch_size": 100,
     "retry_attempts": 3,
     "retry_backoff_seconds": 3,

@@ -89,7 +89,7 @@ def load_config() -> Dict:
             "request_timeout_ms": 15000
         },
         "agent": {
-            "system_id_mode": "AUTO",
+            "system_id_mode": "GUIDE",
             "batch_size": 20,
             "retry_attempts": 3,
             "retry_backoff_seconds": 3

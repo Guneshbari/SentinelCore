@@ -1,0 +1,7 @@
+{
+  "typeCheckingMode": "basic",
+  "pythonPlatform": "Windows",
+  "extraPaths": ["src"],
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none"
+}

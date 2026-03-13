@@ -36,9 +36,8 @@ export default function OverviewPage() {
         <p className="text-xs text-text-muted mt-0.5">System telemetry & alert activity overview</p>
       </div>
 
-      {/* ── Top Row: KPI Strip + Pipeline Status ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-5 gap-3">
-        <div className="lg:col-span-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+      {/* ── Top Row: KPI Strip ── */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <DashboardCard
             title="Systems Online"
             value={systems.filter(s => s.status === 'online').length}
@@ -73,10 +72,9 @@ export default function OverviewPage() {
             iconBg="bg-signal-primary/15"
           />
         </div>
-        {/* Pipeline Health Panel */}
-        <div className="flex flex-col justify-center">
-          <PipelineHealthPanel />
-        </div>
+      {/* ── Second Row: Pipeline Status ── */}
+      <div>
+        <PipelineHealthPanel />
       </div>
 
       {/* ── Middle Row: Health Heatmap + Live Event Stream ── */}

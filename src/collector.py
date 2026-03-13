@@ -29,27 +29,27 @@ import winreg
 import uuid
 
 try:
-    import win32evtlog
-    import pywintypes
+    import win32evtlog  # type: ignore[import]
+    import pywintypes  # type: ignore[import]
 except ImportError:
     print("ERROR: pywin32 required. pip install pywin32", file=sys.stderr)
     sys.exit(1)
 
 try:
-    import psutil
+    import psutil  # type: ignore[import]
 except ImportError:
     print("ERROR: psutil required. pip install psutil", file=sys.stderr)
     sys.exit(1)
 
 try:
-    import requests
+    import requests  # type: ignore[import]
 except ImportError:
     print("ERROR: requests required. pip install requests", file=sys.stderr)
     sys.exit(1)
 
 try:
-    from kafka import KafkaProducer
-    from kafka.errors import KafkaError
+    from kafka import KafkaProducer  # type: ignore[import]
+    from kafka.errors import KafkaError  # type: ignore[import]
     HAS_KAFKA = True
 except ImportError:
     HAS_KAFKA = False
@@ -223,7 +223,7 @@ def check_disk_space() -> bool:
 
 def is_admin() -> bool:
     try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0  # type: ignore[attr-defined]
     except Exception:
         return False
 
@@ -347,9 +347,9 @@ def get_system_id() -> str:
     if _CONFIG["agent"].get("system_id_mode") == "AUTO":
         return socket.gethostname()
     try:
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0, winreg.KEY_READ)
-        guid, _ = winreg.QueryValueEx(key, "MachineGuid")
-        winreg.CloseKey(key)
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0, winreg.KEY_READ)  # type: ignore[attr-defined]
+        guid, _ = winreg.QueryValueEx(key, "MachineGuid")  # type: ignore[attr-defined]
+        winreg.CloseKey(key)  # type: ignore[attr-defined]
         return guid
     except Exception as e:
         print(f"Warning: Could not read MachineGuid: {e}", file=sys.stderr)
@@ -373,10 +373,10 @@ def get_boot_session_id() -> str:
 
 def get_os_version() -> str:
     try:
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", 0, winreg.KEY_READ)
-        name, _  = winreg.QueryValueEx(key, "ProductName")
-        build, _ = winreg.QueryValueEx(key, "CurrentBuild")
-        winreg.CloseKey(key)
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", 0, winreg.KEY_READ)  # type: ignore[attr-defined]
+        name, _  = winreg.QueryValueEx(key, "ProductName")  # type: ignore[attr-defined]
+        build, _ = winreg.QueryValueEx(key, "CurrentBuild")  # type: ignore[attr-defined]
+        winreg.CloseKey(key)  # type: ignore[attr-defined]
         return f"{name} (Build {build})"
     except Exception:
         return "Windows (Unknown Version)"
@@ -405,15 +405,15 @@ def get_local_ip() -> str:
 # RESOURCE MONITORING
 # ============================================================================
 
-def get_resource_snapshot() -> Dict:
+def get_resource_snapshot() -> Dict[str, float]:
     """Single resource snapshot — call once per cycle, not per event."""
     try:
         mem  = psutil.virtual_memory()
         disk = psutil.disk_usage('/')
         return {
-            'cpu_usage_percent':    round(psutil.cpu_percent(interval=0.1), 2),
-            'memory_usage_percent': round(mem.percent, 2),
-            'disk_free_percent':    round(100.0 - disk.percent, 2)
+            'cpu_usage_percent':    round(float(psutil.cpu_percent(interval=0.1)), 2),  # type: ignore[call-overload]
+            'memory_usage_percent': round(float(mem.percent), 2),  # type: ignore[call-overload]
+            'disk_free_percent':    round(float(100.0 - disk.percent), 2)  # type: ignore[call-overload]
         }
     except Exception:
         return {'cpu_usage_percent': 0.0, 'memory_usage_percent': 0.0, 'disk_free_percent': 0.0}
@@ -633,7 +633,8 @@ class KafkaManager:
                 'event':               event
             }
             try:
-                futures.append((event, self.producer.send(self.topic, key=system_id, value=msg)))
+                assert self.producer is not None
+                futures.append((event, self.producer.send(self.topic, key=system_id, value=msg)))  # type: ignore[union-attr]
             except Exception as e:
                 result['failed'] += 1
                 logger.error(f"Send error: {e}")
@@ -647,7 +648,8 @@ class KafkaManager:
                 result['failed'] += 1
                 logger.error(f"Delivery failed for {event.get('event_hash','?')[:12]}: {e}")
                 try:
-                    self.producer.flush(timeout=30)
+                    if self.producer:
+                        self.producer.flush(timeout=30)  # type: ignore[union-attr]
                 except Exception:
                     pass
 
@@ -657,8 +659,8 @@ class KafkaManager:
     def close(self):
         if self.producer:
             try:
-                self.producer.flush(timeout=10)
-                self.producer.close(timeout=10)
+                self.producer.flush(timeout=10)  # type: ignore[union-attr]
+                self.producer.close(timeout=10)  # type: ignore[union-attr]
                 logger.info("Kafka producer closed")
             except Exception as e:
                 logger.error(f"Error closing Kafka producer: {e}")
@@ -710,6 +712,7 @@ class OutputStrategy(ABC):
     @abstractmethod
     def send(self, payload: Dict) -> bool:
         """Send payload. Returns True on full success."""
+        ...
 
     def close(self):
         pass
@@ -717,7 +720,7 @@ class OutputStrategy(ABC):
     @property
     @abstractmethod
     def name(self) -> str:
-        pass
+        ...
 
 
 class KafkaOutputStrategy(OutputStrategy):
@@ -921,9 +924,9 @@ def run_collector():
                         'process_id':           ev['metadata']['process_id'],
                         'thread_id':            ev['metadata']['thread_id'],
                         'event_time':           ev['metadata']['event_time'],
-                        'cpu_usage_percent':    resources['cpu_usage_percent'],
-                        'memory_usage_percent': resources['memory_usage_percent'],
-                        'disk_free_percent':    resources['disk_free_percent'],
+                        'cpu_usage_percent':    resources['cpu_usage_percent'],  # type: ignore[arg-type]
+                        'memory_usage_percent': resources['memory_usage_percent'],  # type: ignore[arg-type]
+                        'disk_free_percent':    resources['disk_free_percent'],  # type: ignore[arg-type]
                         'event_hash':           h,
                         'fault_type':           fault['fault_type'],
                         'fault_description':    fault['fault_description'],
@@ -967,7 +970,7 @@ def run_collector():
                 checkpoint_mgr.save()
 
             print(f"Cycle done in {time.time() - cycle_start:.2f}s\n")
-            sleep_time = max(0, COLLECTION_INTERVAL_SECONDS - (time.time() - cycle_start))
+            sleep_time = max(0.0, COLLECTION_INTERVAL_SECONDS - (time.time() - cycle_start))
             if sleep_time:
                 time.sleep(sleep_time)
 

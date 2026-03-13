@@ -9,6 +9,7 @@ CHANGES FROM v2.0.0:
 - connect_postgres / ensure_db_connection merged into one clean DB manager class
 - Removed redundant outer cursor declaration before the loop
 """
+from __future__ import annotations
 
 import json
 import os
@@ -18,23 +19,24 @@ import logging
 import time
 import threading
 from datetime import datetime
+from typing import Optional
 
 try:
-    from kafka import KafkaConsumer
-    from kafka.errors import KafkaError
+    from kafka import KafkaConsumer  # type: ignore[import]
+    from kafka.errors import KafkaError  # type: ignore[import]
 except ImportError:
     print("ERROR: kafka-python-ng required. pip install kafka-python-ng", file=sys.stderr)
     sys.exit(1)
 
 try:
-    import psycopg2
-    from psycopg2.extras import Json
+    import psycopg2  # type: ignore[import]
+    from psycopg2.extras import Json  # type: ignore[import]
 except ImportError:
     print("ERROR: psycopg2 required. pip install psycopg2-binary", file=sys.stderr)
     sys.exit(1)
 
 try:
-    from prometheus_client import start_http_server, Counter, Histogram, Gauge
+    from prometheus_client import start_http_server, Counter, Histogram, Gauge  # type: ignore[import]
 except ImportError:
     print("ERROR: prometheus-client required. pip install prometheus-client", file=sys.stderr)
     sys.exit(1)
@@ -110,11 +112,17 @@ ON CONFLICT (event_hash) DO NOTHING;
 # ============================================================================
 
 _shutdown = threading.Event()
+_consumer_ref = None
 
 
 def _handle_signal(sig, frame):
     logger.info("Shutdown signal received — finishing current batch...")
     _shutdown.set()
+    if _consumer_ref is not None:
+        try:
+            _consumer_ref.close()
+        except Exception:
+            pass
 
 
 signal.signal(signal.SIGINT,  _handle_signal)
@@ -133,8 +141,8 @@ class DBManager:
     - commit/rollback  : explicit transaction control
     """
 
-    def __init__(self):
-        self._conn = None
+    def __init__(self) -> None:
+        self._conn: Optional[psycopg2.extensions.connection] = None
 
     def connect(self, max_retries: int = DB_MAX_RETRIES) -> bool:
         """Attempt to connect. Returns True on success, False after all retries."""
@@ -145,7 +153,7 @@ class DBManager:
                     dbname=POSTGRES_DB, user=POSTGRES_USER,
                     password=POSTGRES_PASSWORD
                 )
-                self._conn.autocommit = False
+                self._conn.autocommit = False  # type: ignore[union-attr]
                 logger.info(f"Connected to PostgreSQL at {POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
                 return True
             except psycopg2.Error as e:
@@ -162,7 +170,7 @@ class DBManager:
         """Verify connection is alive; reconnect if not. Returns True if ready."""
         if self._conn is not None:
             try:
-                with self._conn.cursor() as cur:
+                with self._conn.cursor() as cur:  # type: ignore[union-attr]
                     cur.execute("SELECT 1")
                 return True
             except Exception:
@@ -172,14 +180,17 @@ class DBManager:
 
     def new_cursor(self):
         """Return a fresh cursor. Caller is responsible for closing it."""
+        assert self._conn is not None, "DB not connected"
         return self._conn.cursor()
 
     def commit(self):
-        self._conn.commit()
+        assert self._conn is not None, "DB not connected"
+        self._conn.commit()  # type: ignore[union-attr]
 
     def rollback(self):
         try:
-            self._conn.rollback()
+            if self._conn:
+                self._conn.rollback()  # type: ignore[union-attr]
         except Exception as e:
             logger.error(f"Rollback failed: {e}")
             self._close_quietly()
@@ -187,7 +198,7 @@ class DBManager:
     def _close_quietly(self):
         try:
             if self._conn:
-                self._conn.close()
+                self._conn.close()  # type: ignore[union-attr]
         except Exception:
             pass
         self._conn = None
@@ -261,7 +272,7 @@ def run_consumer():
 
     # ── Connect to Kafka ─────────────────────────────────────────────────────
     consumer = None
-    kafka_attempt = 0
+    kafka_attempt: int = 0
     while consumer is None and not _shutdown.is_set():
         try:
             consumer = KafkaConsumer(
@@ -275,8 +286,10 @@ def run_consumer():
                 max_poll_records=KAFKA_MAX_POLL_RECORDS
             )
             logger.info("Connected to Kafka consumer")
+            global _consumer_ref
+            _consumer_ref = consumer
         except Exception as e:
-            kafka_attempt += 1
+            kafka_attempt += 1  # type: ignore[operator]
             backoff = min(DB_RETRY_BACKOFF_BASE * (2 ** kafka_attempt), DB_MAX_BACKOFF)
             logger.error(f"Kafka connection failed (attempt {kafka_attempt}): {e}")
             logger.info(f"  Retrying in {backoff:.0f}s...")
@@ -288,9 +301,9 @@ def run_consumer():
         return
 
     # ── Counters (named for what they actually track) ─────────────────────
-    total_inserted    = 0   # rows written to DB
-    total_skipped     = 0   # processing errors for individual messages
-    total_batch_fails = 0   # batches rolled back due to DB error
+    total_inserted: int    = 0   # rows written to DB
+    total_skipped: int     = 0   # processing errors for individual messages
+    total_batch_fails: int = 0   # batches rolled back due to DB error
 
     logger.info("\nListening for events... (Ctrl+C to stop)\n")
 
@@ -320,12 +333,12 @@ def run_consumer():
             if not db.ensure():
                 logger.error("PostgreSQL unavailable — skipping batch (offsets NOT committed, will re-process).")
                 pipeline_errors_total.inc()
-                total_batch_fails += 1
+                total_batch_fails += 1  # type: ignore[operator]
                 time.sleep(5)
                 continue
 
-            batch_inserted = 0
-            batch_failed   = False
+            batch_inserted: int = 0
+            batch_failed: bool  = False
 
             # ── Open cursor INSIDE the transaction scope ───────────────────
             cursor = db.new_cursor()
@@ -343,7 +356,7 @@ def run_consumer():
                             break
                         try:
                             process_message(record.value, cursor)
-                            batch_inserted += 1
+                            batch_inserted += 1  # type: ignore[operator]
                             events_processed_total.inc()
                         except psycopg2.Error as e:
                             logger.error(f"DB insert error: {e}")
@@ -353,7 +366,7 @@ def run_consumer():
                         except Exception as e:
                             logger.error(f"Message processing error (skipping): {e}")
                             pipeline_errors_total.inc()
-                            total_skipped += 1
+                            total_skipped += 1  # type: ignore[operator]
                     if batch_failed or _shutdown.is_set():
                         break
 
@@ -370,7 +383,7 @@ def run_consumer():
                     logger.error(f"Kafka offset commit failed: {e} — some messages may re-process")
                     pipeline_errors_total.inc()
 
-                total_inserted += batch_inserted
+                total_inserted += batch_inserted  # type: ignore[operator]
                 if batch_inserted:
                     logger.info(
                         f"Inserted {batch_inserted} event(s) | "
@@ -383,7 +396,7 @@ def run_consumer():
                 db.rollback()
                 logger.warning(f"Batch ROLLED BACK — offsets NOT committed, will re-process.")
                 pipeline_errors_total.inc()
-                total_batch_fails += 1
+                total_batch_fails += 1  # type: ignore[operator]
                 time.sleep(2)
 
             finally:

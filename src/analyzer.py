@@ -26,12 +26,12 @@ from typing import Any, List, Dict, Optional, Tuple, cast
 
 ANALYZER_VERSION = "2.0.0"
 
-LEVEL_NAMES = {1: 'CRITICAL', 2: 'ERROR', 3: 'WARNING', 4: 'INFO', 5: 'VERBOSE'}
-
-# Resource alert thresholds (match collector.py)
-CPU_ALERT_THRESHOLD    = 90   # percent
-MEMORY_ALERT_THRESHOLD = 90   # percent
-DISK_LOW_THRESHOLD     = 10   # percent free
+from shared import (
+    LEVEL_NAMES,
+    CPU_ALERT_THRESHOLD,
+    MEMORY_ALERT_THRESHOLD,
+    DISK_LOW_THRESHOLD
+)
 
 # ============================================================================
 # UNIFIED KNOWLEDGE BASE

@@ -64,12 +64,13 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 CONFIG_FILE = os.path.join(PROJECT_ROOT, "config.json")
 
-LEVEL_NAMES = {1: 'CRITICAL', 2: 'ERROR', 3: 'WARNING', 4: 'INFO', 5: 'VERBOSE'}
-
-# Resource alert thresholds
-CPU_ALERT_THRESHOLD    = 90   # percent
-MEMORY_ALERT_THRESHOLD = 90   # percent
-DISK_LOW_THRESHOLD     = 10   # percent free
+from shared import (
+    LEVEL_NAMES,
+    CPU_ALERT_THRESHOLD,
+    MEMORY_ALERT_THRESHOLD,
+    DISK_LOW_THRESHOLD,
+    setup_logger
+)
 
 # ============================================================================
 # CONFIGURATION
@@ -164,16 +165,7 @@ LOG_FILE         = os.path.join(SCRIPT_DIR, "sentinel.log")
 # LOGGING
 # ============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE, encoding='utf-8')
-    ]
-)
-logger = logging.getLogger('SentinelCore')
+logger = setup_logger('SentinelCore', LOG_FILE)
 
 # ============================================================================
 # PID LOCK

@@ -82,13 +82,8 @@ kafka_consumer_lag = Gauge('kafka_consumer_lag', 'Approximate number of messages
 # LOGGING
 # ============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger('SentinelConsumer')
+from shared import setup_logger
+logger = setup_logger('SentinelConsumer')
 
 # ============================================================================
 # INSERT QUERY — idempotent via ON CONFLICT

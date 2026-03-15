@@ -22,3 +22,23 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Testing
+/coverage
+
+# Environment
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env
+
+# Vite cache
+.vite/
+vite.config.ts.timestamp-*
+
+# Design tool (Stitch)
+.stitch/
+
+# Lint cache
+.eslintcache
